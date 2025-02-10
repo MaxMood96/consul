@@ -1,10 +1,11 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package envoy
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
@@ -20,7 +21,14 @@ const (
   "ignore_health_on_host_removal": false,
   "connect_timeout": "5s",
   "type": "STATIC",
-  "http_protocol_options": {},
+  "typed_extension_protocol_options": {
+	"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+      "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+      "explicit_http_config": {
+        "http_protocol_options": {}
+      }
+    }
+  },
   "loadAssignment": {
     "clusterName": "self_admin",
     "endpoints": [
@@ -46,7 +54,14 @@ const (
   "ignore_health_on_host_removal": false,
   "connect_timeout": "5s",
   "type": "STATIC",
-  "http_protocol_options": {},
+  "typed_extension_protocol_options": {
+    "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+	  "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+      "explicit_http_config": {
+        "http_protocol_options": {}
+      }
+    }
+  },
   "loadAssignment": {
     "clusterName": "self_admin",
     "endpoints": [
@@ -72,7 +87,14 @@ const (
   "ignore_health_on_host_removal": false,
   "connect_timeout": "5s",
   "type": "STATIC",
-  "http_protocol_options": {},
+  "typed_extension_protocol_options": {
+	"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+	 "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+	 "explicit_http_config": {
+	  "http_protocol_options": {}
+	 }
+	}
+   },
   "loadAssignment": {
     "clusterName": "prometheus_backend",
     "endpoints": [
@@ -530,25 +552,33 @@ const (
 	}
 }`
 
-	expectedHCPMetricsStatsSink = `{
+	expectedTelemetryCollectorStatsSink = `{
 	"name": "envoy.stat_sinks.metrics_service",
 	"typed_config": {
 	  "@type": "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig",
 	  "transport_api_version": "V3",
 	  "grpc_service": {
 		"envoy_grpc": {
-		  "cluster_name": "hcp_metrics_collector"
+		  "cluster_name": "consul_telemetry_collector_loopback"
 		}
-	  }
+	  },
+	  "emit_tags_as_labels": true
 	}
   }`
 
-	expectedHCPMetricsCluster = `{
-	"name": "hcp_metrics_collector",
+	expectedTelemetryCollectorCluster = `{
+	"name": "consul_telemetry_collector_loopback",
 	"type": "STATIC",
-	"http2_protocol_options": {},
+	"typed_extension_protocol_options": {
+	  "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+		"@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+		"explicit_http_config": {
+		  "http2_protocol_options": {}
+		}
+	  }
+	},
 	"loadAssignment": {
-	  "clusterName": "hcp_metrics_collector",
+	  "clusterName": "consul_telemetry_collector_loopback",
 	  "endpoints": [
 		{
 		  "lbEndpoints": [
@@ -556,7 +586,7 @@ const (
 			  "endpoint": {
 				"address": {
 				  "pipe": {
-					"path": "/tmp/consul/hcp-metrics/default_web-sidecar-proxy.sock"
+					"path": "/tmp/consul/telemetry-collector/gqmuzdHCUPAEY5mbF8vgkZCNI14.sock"
 				  }
 				}
 			  }
@@ -619,53 +649,57 @@ func TestBootstrapConfig_ConfigureArgs(t *testing.T) {
 			},
 		},
 		{
-			name: "hcp-metrics-sink",
+			name: "telemetry-collector-sink",
 			baseArgs: BootstrapTplArgs{
 				ProxyID: "web-sidecar-proxy",
 			},
 			input: BootstrapConfig{
-				HCPMetricsBindSocketDir: "/tmp/consul/hcp-metrics",
+				TelemetryCollectorBindSocketDir: "/tmp/consul/telemetry-collector",
 			},
 			wantArgs: BootstrapTplArgs{
-				ProxyID:         "web-sidecar-proxy",
-				StatsConfigJSON: defaultStatsConfigJSON,
-				StatsSinksJSON: `{
-					"name": "envoy.stat_sinks.metrics_service",
-					"typed_config": {
-					  "@type": "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig",
-					  "transport_api_version": "V3",
-					  "grpc_service": {
-						"envoy_grpc": {
-						  "cluster_name": "hcp_metrics_collector"
-						}
-					  }
-					}
-				  }`,
-				StaticClustersJSON: `{
-					"name": "hcp_metrics_collector",
-					"type": "STATIC",
-					"http2_protocol_options": {},
-					"loadAssignment": {
-					  "clusterName": "hcp_metrics_collector",
-					  "endpoints": [
-						{
-						  "lbEndpoints": [
-							{
-							  "endpoint": {
-								"address": {
-								  "pipe": {
-									"path": "/tmp/consul/hcp-metrics/default_web-sidecar-proxy.sock"
-								  }
-								}
-							  }
-							}
-						  ]
-						}
-					  ]
-					}
-				  }`,
+				StatsFlushInterval: "60s",
+				ProxyID:            "web-sidecar-proxy",
+				StatsConfigJSON:    defaultStatsConfigJSON,
+				StatsSinksJSON:     expectedTelemetryCollectorStatsSink,
+				StaticClustersJSON: expectedTelemetryCollectorCluster,
 			},
 			wantErr: false,
+		},
+		{
+			name: "telemetry-collector-no-default-flush-interval-when-interval-preconfigured",
+			baseArgs: BootstrapTplArgs{
+				ProxyID: "web-sidecar-proxy",
+			},
+			input: BootstrapConfig{
+				// Explicitly defined StatsFlushInterval by end user should not be overriden.
+				StatsFlushInterval:              "10s",
+				TelemetryCollectorBindSocketDir: "/tmp/consul/telemetry-collector",
+			},
+			wantArgs: BootstrapTplArgs{
+				StatsFlushInterval: "10s",
+				ProxyID:            "web-sidecar-proxy",
+				StatsConfigJSON:    defaultStatsConfigJSON,
+				StatsSinksJSON:     expectedTelemetryCollectorStatsSink,
+				StaticClustersJSON: expectedTelemetryCollectorCluster,
+			},
+		},
+		{
+			name: "telemetry-collector-no-default-flush-interval-when-sinks-preconfigured",
+			baseArgs: BootstrapTplArgs{
+				ProxyID: "web-sidecar-proxy",
+			},
+			input: BootstrapConfig{
+				// If stats sinks are explicitly defined by end user, do not default StatsFlushInterval.
+				StatsdURL:                       "udp://127.0.0.1:9125",
+				TelemetryCollectorBindSocketDir: "/tmp/consul/telemetry-collector",
+			},
+			wantArgs: BootstrapTplArgs{
+				StatsFlushInterval: "",
+				ProxyID:            "web-sidecar-proxy",
+				StatsConfigJSON:    defaultStatsConfigJSON,
+				StatsSinksJSON:     fmt.Sprintf(`%s,%s`, expectedStatsdSink, expectedTelemetryCollectorStatsSink),
+				StaticClustersJSON: expectedTelemetryCollectorCluster,
+			},
 		},
 		{
 			name: "simple-statsd-sink",
@@ -1522,7 +1556,7 @@ func TestConsulTagSpecifiers(t *testing.T) {
 			},
 		},
 		{
-			name: "tcp listener no namespace or partition (OSS)",
+			name: "tcp listener no namespace or partition (CE)",
 			stat: "tcp.upstream.db.dc1.downstream_cx_total",
 			expect: map[string][]string{
 				"consul.upstream.datacenter": {"db.dc1.", "dc1"},
@@ -1532,7 +1566,7 @@ func TestConsulTagSpecifiers(t *testing.T) {
 			},
 		},
 		{
-			name: "tcp peered listener no namespace or partition (OSS)",
+			name: "tcp peered listener no namespace or partition (CE)",
 			stat: "tcp.upstream_peered.db.cloudpeer.downstream_cx_total",
 			expect: map[string][]string{
 				"consul.upstream.peer":      {"db.cloudpeer.", "cloudpeer"},
@@ -1560,7 +1594,7 @@ func TestConsulTagSpecifiers(t *testing.T) {
 			},
 		},
 		{
-			name: "http listener no namespace or partition (OSS)",
+			name: "http listener no namespace or partition (CE)",
 			stat: "http.upstream.web.dc1.downstream_cx_total",
 			expect: map[string][]string{
 				"consul.upstream.datacenter": {"web.dc1.", "dc1"},
@@ -1570,7 +1604,7 @@ func TestConsulTagSpecifiers(t *testing.T) {
 			},
 		},
 		{
-			name: "http peered listener no namespace or partition (OSS)",
+			name: "http peered listener no namespace or partition (CE)",
 			stat: "http.upstream_peered.web.cloudpeer.downstream_cx_total",
 			expect: map[string][]string{
 				"consul.upstream.peer":      {"web.cloudpeer.", "cloudpeer"},
@@ -1631,7 +1665,7 @@ func TestConsulTagSpecifiers(t *testing.T) {
 	}
 }
 
-func TestAppendHCPMetrics(t *testing.T) {
+func TestAppendTelemetryCollectorMetrics(t *testing.T) {
 	tests := map[string]struct {
 		inputArgs     *BootstrapTplArgs
 		bindSocketDir string
@@ -1641,22 +1675,22 @@ func TestAppendHCPMetrics(t *testing.T) {
 			inputArgs: &BootstrapTplArgs{
 				ProxyID: "web-sidecar-proxy",
 			},
-			bindSocketDir: "/tmp/consul/hcp-metrics",
+			bindSocketDir: "/tmp/consul/telemetry-collector",
 			wantArgs: &BootstrapTplArgs{
 				ProxyID:            "web-sidecar-proxy",
-				StatsSinksJSON:     expectedHCPMetricsStatsSink,
-				StaticClustersJSON: expectedHCPMetricsCluster,
+				StatsSinksJSON:     expectedTelemetryCollectorStatsSink,
+				StaticClustersJSON: expectedTelemetryCollectorCluster,
 			},
 		},
 		"dir-with-trailing-slash": {
 			inputArgs: &BootstrapTplArgs{
 				ProxyID: "web-sidecar-proxy",
 			},
-			bindSocketDir: "/tmp/consul/hcp-metrics",
+			bindSocketDir: "/tmp/consul/telemetry-collector",
 			wantArgs: &BootstrapTplArgs{
 				ProxyID:            "web-sidecar-proxy",
-				StatsSinksJSON:     expectedHCPMetricsStatsSink,
-				StaticClustersJSON: expectedHCPMetricsCluster,
+				StatsSinksJSON:     expectedTelemetryCollectorStatsSink,
+				StaticClustersJSON: expectedTelemetryCollectorCluster,
 			},
 		},
 		"append-clusters-and-stats-sink": {
@@ -1665,18 +1699,18 @@ func TestAppendHCPMetrics(t *testing.T) {
 				StatsSinksJSON:     expectedStatsdSink,
 				StaticClustersJSON: expectedSelfAdminCluster,
 			},
-			bindSocketDir: "/tmp/consul/hcp-metrics",
+			bindSocketDir: "/tmp/consul/telemetry-collector",
 			wantArgs: &BootstrapTplArgs{
 				ProxyID:            "web-sidecar-proxy",
-				StatsSinksJSON:     expectedStatsdSink + ",\n" + expectedHCPMetricsStatsSink,
-				StaticClustersJSON: expectedSelfAdminCluster + ",\n" + expectedHCPMetricsCluster,
+				StatsSinksJSON:     expectedStatsdSink + ",\n" + expectedTelemetryCollectorStatsSink,
+				StaticClustersJSON: expectedSelfAdminCluster + ",\n" + expectedTelemetryCollectorCluster,
 			},
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			appendHCPMetricsConfig(tt.inputArgs, tt.bindSocketDir)
+			appendTelemetryCollectorConfig(tt.inputArgs, tt.bindSocketDir)
 
 			// Some of our JSON strings are comma separated objects to be
 			// insertedinto an array which is not valid JSON on it's own so wrap

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -14,17 +14,20 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/armon/go-metrics/prometheus"
+	"golang.org/x/time/rate"
+
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/serf/serf"
-	"golang.org/x/time/rate"
 
 	"github.com/hashicorp/consul/acl"
 	rpcRate "github.com/hashicorp/consul/agent/consul/rate"
 	"github.com/hashicorp/consul/agent/pool"
 	"github.com/hashicorp/consul/agent/router"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/logging"
+	"github.com/hashicorp/consul/proto-public/pbresource"
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 )
@@ -32,15 +35,15 @@ import (
 var ClientCounters = []prometheus.CounterDefinition{
 	{
 		Name: []string{"client", "rpc"},
-		Help: "Increments whenever a Consul agent in client mode makes an RPC request to a Consul server.",
+		Help: "Increments whenever a Consul agent makes an RPC request to a Consul server.",
 	},
 	{
 		Name: []string{"client", "rpc", "exceeded"},
-		Help: "Increments whenever a Consul agent in client mode makes an RPC request to a Consul server gets rate limited by that agent's limits configuration.",
+		Help: "Increments whenever a Consul agent makes an RPC request to a Consul server gets rate limited by that agent's limits configuration.",
 	},
 	{
 		Name: []string{"client", "rpc", "failed"},
-		Help: "Increments whenever a Consul agent in client mode makes an RPC request to a Consul server and fails.",
+		Help: "Increments whenever a Consul agent makes an RPC request to a Consul server and fails.",
 	},
 }
 
@@ -93,6 +96,9 @@ type Client struct {
 	EnterpriseClient
 
 	tlsConfigurator *tlsutil.Configurator
+
+	// resourceServiceClient is a client for the gRPC Resource Service.
+	resourceServiceClient pbresource.ResourceServiceClient
 }
 
 // NewClient creates and returns a Client
@@ -103,7 +109,7 @@ func NewClient(config *Config, deps Deps) (*Client, error) {
 	if config.DataDir == "" {
 		return nil, fmt.Errorf("Config must provide a DataDir")
 	}
-	if err := config.CheckACL(); err != nil {
+	if err := config.CheckEnumStrings(); err != nil {
 		return nil, err
 	}
 
@@ -150,6 +156,13 @@ func NewClient(config *Config, deps Deps) (*Client, error) {
 		return nil, fmt.Errorf("Failed to add LAN area to the RPC router: %w", err)
 	}
 	c.router = deps.Router
+
+	conn, err := deps.GRPCConnPool.ClientConn(deps.ConnPool.Datacenter)
+	if err != nil {
+		c.Shutdown()
+		return nil, fmt.Errorf("Failed to get gRPC client connection: %w", err)
+	}
+	c.resourceServiceClient = pbresource.NewResourceServiceClient(conn)
 
 	// Start LAN event handlers after the router is complete since the event
 	// handlers depend on the router and the router depends on Serf.
@@ -277,15 +290,17 @@ func (c *Client) RPC(ctx context.Context, method string, args interface{}, reply
 	firstCheck := time.Now()
 	retryCount := 0
 	previousJitter := time.Duration(0)
+
+	metrics.IncrCounter([]string{"client", "rpc"}, 1)
 TRY:
 	retryCount++
 	manager, server := c.router.FindLANRoute()
 	if server == nil {
+		metrics.IncrCounter([]string{"client", "rpc", "failed"}, 1)
 		return structs.ErrNoServers
 	}
 
 	// Enforce the RPC limit.
-	metrics.IncrCounter([]string{"client", "rpc"}, 1)
 	if !c.rpcLimiter.Load().(*rate.Limiter).Allow() {
 		metrics.IncrCounter([]string{"client", "rpc", "exceeded"}, 1)
 		return structs.ErrRPCRateExceeded
@@ -426,13 +441,13 @@ func (c *Client) Stats() map[string]map[string]string {
 // are ancillary members of.
 //
 // NOTE: This assumes coordinates are enabled, so check that before calling.
-func (c *Client) GetLANCoordinate() (lib.CoordinateSet, error) {
+func (c *Client) GetLANCoordinate() (librtt.CoordinateSet, error) {
 	lan, err := c.serf.GetCoordinate()
 	if err != nil {
 		return nil, err
 	}
 
-	cs := lib.CoordinateSet{c.config.Segment: lan}
+	cs := librtt.CoordinateSet{c.config.Segment: lan}
 	return cs, nil
 }
 
@@ -450,4 +465,8 @@ func (c *Client) AgentEnterpriseMeta() *acl.EnterpriseMeta {
 
 func (c *Client) agentSegmentName() string {
 	return c.config.Segment
+}
+
+func (c *Client) ResourceServiceClient() pbresource.ResourceServiceClient {
+	return c.resourceServiceClient
 }

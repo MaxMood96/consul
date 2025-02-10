@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-bexpr"
+	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/copystructure"
 	"github.com/mitchellh/hashstructure"
 
@@ -78,8 +79,17 @@ type ServiceRouterConfigEntry struct {
 	Routes []ServiceRoute
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceRouterConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceRouterConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceRouterConfigEntry) GetKind() string {
@@ -128,6 +138,11 @@ func (e *ServiceRouterConfigEntry) Normalize() error {
 		}
 	}
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -357,9 +372,10 @@ func (m *ServiceRouteMatch) IsEmpty() bool {
 
 // ServiceRouteHTTPMatch is a set of http-specific match criteria.
 type ServiceRouteHTTPMatch struct {
-	PathExact  string `json:",omitempty" alias:"path_exact"`
-	PathPrefix string `json:",omitempty" alias:"path_prefix"`
-	PathRegex  string `json:",omitempty" alias:"path_regex"`
+	PathExact       string `json:",omitempty" alias:"path_exact"`
+	PathPrefix      string `json:",omitempty" alias:"path_prefix"`
+	PathRegex       string `json:",omitempty" alias:"path_regex"`
+	CaseInsensitive bool   `json:",omitempty" alias:"case_insensitive"`
 
 	Header     []ServiceRouteHTTPMatchHeader     `json:",omitempty"`
 	QueryParam []ServiceRouteHTTPMatchQueryParam `json:",omitempty" alias:"query_param"`
@@ -370,6 +386,7 @@ func (m *ServiceRouteHTTPMatch) IsEmpty() bool {
 	return m.PathExact == "" &&
 		m.PathPrefix == "" &&
 		m.PathRegex == "" &&
+		!m.CaseInsensitive &&
 		len(m.Header) == 0 &&
 		len(m.QueryParam) == 0 &&
 		len(m.Methods) == 0
@@ -536,8 +553,17 @@ type ServiceSplitterConfigEntry struct {
 	Splits []ServiceSplit
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceSplitterConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceSplitterConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceSplitterConfigEntry) GetKind() string {
@@ -580,6 +606,11 @@ func (e *ServiceSplitterConfigEntry) Normalize() error {
 		}
 	}
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -857,6 +888,10 @@ type ServiceResolverConfigEntry struct {
 	// specified here.
 	Failover map[string]ServiceResolverFailover `json:",omitempty"`
 
+	// PrioritizeByLocality controls whether the locality of services within the
+	// local partition will be used to prioritize connectivity.
+	PrioritizeByLocality *ServiceResolverPrioritizeByLocality `json:",omitempty" alias:"prioritize_by_locality"`
+
 	// ConnectTimeout is the timeout for establishing new network connections
 	// to this service.
 	ConnectTimeout time.Duration `json:",omitempty" alias:"connect_timeout"`
@@ -871,8 +906,17 @@ type ServiceResolverConfigEntry struct {
 	LoadBalancer *LoadBalancer `json:",omitempty" alias:"load_balancer"`
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceResolverConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceResolverConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceResolverConfigEntry) RelatedPeers() []string {
@@ -925,21 +969,22 @@ func (e *ServiceResolverConfigEntry) UnmarshalJSON(data []byte) error {
 	}{
 		Alias: (*Alias)(e),
 	}
-	if err := lib.UnmarshalJSON(data, &aux); err != nil {
+	var err error
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
 		return err
 	}
-	var err error
+	var merr *multierror.Error
 	if aux.ConnectTimeout != "" {
 		if e.ConnectTimeout, err = time.ParseDuration(aux.ConnectTimeout); err != nil {
-			return err
+			merr = multierror.Append(merr, err)
 		}
 	}
 	if aux.RequestTimeout != "" {
 		if e.RequestTimeout, err = time.ParseDuration(aux.RequestTimeout); err != nil {
-			return err
+			merr = multierror.Append(merr, err)
 		}
 	}
-	return nil
+	return merr.ErrorOrNil()
 }
 
 func (e *ServiceResolverConfigEntry) SubsetExists(name string) bool {
@@ -960,7 +1005,8 @@ func (e *ServiceResolverConfigEntry) IsDefault() bool {
 		len(e.Failover) == 0 &&
 		e.ConnectTimeout == 0 &&
 		e.RequestTimeout == 0 &&
-		e.LoadBalancer == nil
+		e.LoadBalancer == nil &&
+		e.PrioritizeByLocality == nil
 }
 
 func (e *ServiceResolverConfigEntry) GetKind() string {
@@ -991,6 +1037,11 @@ func (e *ServiceResolverConfigEntry) Normalize() error {
 
 	e.EnterpriseMeta.Normalize()
 
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
 }
 
@@ -1029,6 +1080,10 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 
 	if e.DefaultSubset != "" && !isSubset(e.DefaultSubset) {
 		return fmt.Errorf("DefaultSubset %q is not a valid subset", e.DefaultSubset)
+	}
+
+	if err := e.PrioritizeByLocality.validate(); err != nil {
+		return err
 	}
 
 	if e.Redirect != nil {
@@ -1113,8 +1168,8 @@ func (e *ServiceResolverConfigEntry) Validate() error {
 				return fmt.Errorf("Bad Failover[%q]: %s", subset, err)
 			}
 
-			if !f.Policy.isValid() {
-				return fmt.Errorf("Bad Failover[%q]: Policy must be one of '', 'sequential', or 'order-by-locality'", subset)
+			if err := f.Policy.validate(); err != nil {
+				return fmt.Errorf("Bad Failover[%q]: %w", subset, err)
 			}
 
 			if f.ServiceSubset != "" {
@@ -1445,13 +1500,6 @@ type ServiceResolverFailover struct {
 	SamenessGroup string `json:",omitempty"`
 }
 
-type ServiceResolverFailoverPolicy struct {
-	// Mode specifies the type of failover that will be performed. Valid values are
-	// "sequential", "" (equivalent to "sequential") and "order-by-locality".
-	Mode    string   `json:",omitempty"`
-	Regions []string `json:",omitempty"`
-}
-
 func (f *ServiceResolverFailover) ToDiscoveryTargetOpts() DiscoveryTargetOpts {
 	return DiscoveryTargetOpts{
 		Service:       f.Service,
@@ -1469,9 +1517,16 @@ func (f *ServiceResolverFailover) isEmpty() bool {
 		f.SamenessGroup == ""
 }
 
-func (fp *ServiceResolverFailoverPolicy) isValid() bool {
+type ServiceResolverFailoverPolicy struct {
+	// Mode specifies the type of failover that will be performed. Valid values are
+	// "sequential", "" (equivalent to "sequential") and "order-by-locality".
+	Mode    string   `json:",omitempty"`
+	Regions []string `json:",omitempty"`
+}
+
+func (fp *ServiceResolverFailoverPolicy) validate() error {
 	if fp == nil {
-		return true
+		return nil
 	}
 
 	switch fp.Mode {
@@ -1479,10 +1534,16 @@ func (fp *ServiceResolverFailoverPolicy) isValid() bool {
 	case "sequential":
 	case "order-by-locality":
 	default:
-		return false
+		return fmt.Errorf("Failover-policy mode must be one of '', 'sequential', or 'order-by-locality'")
 	}
+	return nil
+}
 
-	return true
+type ServiceResolverPrioritizeByLocality struct {
+	// Mode specifies the type of prioritization that will be performed
+	// when selecting nodes in the local partition.
+	// Valid values are: "" (default "none"), "none", and "failover".
+	Mode string `json:",omitempty"`
 }
 
 type ServiceResolverFailoverTarget struct {

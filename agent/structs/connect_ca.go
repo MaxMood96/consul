@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -8,12 +8,11 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/hashicorp/consul/lib/stringslice"
-
 	"github.com/mitchellh/mapstructure"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/lib/stringslice"
 )
 
 const (
@@ -245,6 +244,12 @@ type IssuedCert struct {
 	acl.EnterpriseMeta
 
 	RaftIndex
+}
+
+func (i *IssuedCert) Key() string {
+	return fmt.Sprintf("%s",
+		i.SerialNumber,
+	)
 }
 
 // CAOp is the operation for a request related to intentions.

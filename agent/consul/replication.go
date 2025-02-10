@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -153,6 +153,12 @@ func (r *Replicator) Run(ctx context.Context) error {
 		// Perform a single round of replication
 		index, exit, err := r.delegate.Replicate(ctx, atomic.LoadUint64(&r.lastRemoteIndex), r.logger)
 		if exit {
+			metrics.SetGauge([]string{"leader", "replication", r.delegate.MetricName(), "status"},
+				0,
+			)
+			metrics.SetGauge([]string{"leader", "replication", r.delegate.MetricName(), "index"},
+				0,
+			)
 			return nil
 		}
 		if err != nil {

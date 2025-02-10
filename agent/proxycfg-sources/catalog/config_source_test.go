@@ -1,16 +1,19 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package catalog
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/consul/stream"
@@ -75,7 +78,7 @@ func TestConfigSource_Success(t *testing.T) {
 	})
 	t.Cleanup(mgr.Shutdown)
 
-	snapCh, termCh, cancelWatch1, err := mgr.Watch(serviceID, nodeName, token)
+	snapCh, termCh, _, cancelWatch1, err := mgr.Watch(serviceID, nodeName, token)
 	require.NoError(t, err)
 	require.Equal(t, session1TermCh, termCh)
 
@@ -132,7 +135,7 @@ func TestConfigSource_Success(t *testing.T) {
 	}
 
 	// Start another watch.
-	_, termCh2, cancelWatch2, err := mgr.Watch(serviceID, nodeName, token)
+	_, termCh2, _, cancelWatch2, err := mgr.Watch(serviceID, nodeName, token)
 	require.NoError(t, err)
 	require.Equal(t, session2TermCh, termCh2)
 
@@ -166,6 +169,7 @@ func TestConfigSource_Success(t *testing.T) {
 
 func TestConfigSource_LocallyManagedService(t *testing.T) {
 	serviceID := structs.NewServiceID("web-sidecar-proxy-1", nil)
+	proxyID := serviceID
 	nodeName := "node-1"
 	token := "token"
 
@@ -173,8 +177,8 @@ func TestConfigSource_LocallyManagedService(t *testing.T) {
 	localState.AddServiceWithChecks(&structs.NodeService{ID: serviceID.ID}, nil, "", false)
 
 	localWatcher := NewMockWatcher(t)
-	localWatcher.On("Watch", serviceID, nodeName, token).
-		Return(make(<-chan *proxycfg.ConfigSnapshot), nil, proxycfg.CancelFunc(func() {}), nil)
+	localWatcher.On("Watch", proxyID, nodeName, token).
+		Return(make(<-chan *proxycfg.ConfigSnapshot), nil, nil, context.CancelFunc(func() {}), nil)
 
 	mgr := NewConfigSource(Config{
 		NodeName:          nodeName,
@@ -186,7 +190,7 @@ func TestConfigSource_LocallyManagedService(t *testing.T) {
 	})
 	t.Cleanup(mgr.Shutdown)
 
-	_, _, _, err := mgr.Watch(serviceID, nodeName, token)
+	_, _, _, _, err := mgr.Watch(proxyID, nodeName, token)
 	require.NoError(t, err)
 }
 
@@ -208,7 +212,7 @@ func TestConfigSource_ErrorRegisteringService(t *testing.T) {
 	}))
 
 	var canceledWatch bool
-	cancel := proxycfg.CancelFunc(func() { canceledWatch = true })
+	cancel := context.CancelFunc(func() { canceledWatch = true })
 
 	cfgMgr := NewMockConfigManager(t)
 
@@ -233,11 +237,171 @@ func TestConfigSource_ErrorRegisteringService(t *testing.T) {
 	})
 	t.Cleanup(mgr.Shutdown)
 
-	_, _, _, err := mgr.Watch(serviceID, nodeName, token)
+	_, _, _, _, err := mgr.Watch(serviceID, nodeName, token)
 	require.Error(t, err)
 	require.True(t, canceledWatch, "watch should've been canceled")
 
 	session.AssertCalled(t, "End")
+}
+
+func TestConfigSource_ErrorInSyncLoop(t *testing.T) {
+	serviceID := structs.NewServiceID("web-sidecar-proxy-1", nil)
+	nodeName := "node-name"
+	token := "token"
+
+	store := testStateStore(t)
+
+	// Register the proxy in the catalog/state store at port 9999.
+	require.NoError(t, store.EnsureRegistration(0, &structs.RegisterRequest{
+		Node: nodeName,
+		Service: &structs.NodeService{
+			ID:      serviceID.ID,
+			Service: "web-sidecar-proxy",
+			Port:    9999,
+			Kind:    structs.ServiceKindConnectProxy,
+			Proxy: structs.ConnectProxyConfig{
+				Config: map[string]any{
+					"local_connect_timeout_ms": 123,
+				},
+			},
+		},
+	}))
+
+	cfgMgr := NewMockConfigManager(t)
+	{
+		proxyID := proxycfg.ProxyID{
+			ServiceID: serviceID,
+			NodeName:  nodeName,
+			Token:     token,
+		}
+		snapCh := make(chan *proxycfg.ConfigSnapshot, 1)
+		cfgMgr.On("Watch", proxyID).
+			Return((<-chan *proxycfg.ConfigSnapshot)(snapCh), context.CancelFunc(func() {}), nil)
+
+		// Answer the register call successfully for session 1 starting (Repeatability = 1).
+		// Session 2 should not have caused a re-register to happen.
+		cfgMgr.On("Register", mock.Anything, mock.Anything, source, token, false).
+			Run(func(args mock.Arguments) {
+				id := args.Get(0).(proxycfg.ProxyID)
+				ns := args.Get(1).(*structs.NodeService)
+
+				snapCh <- &proxycfg.ConfigSnapshot{
+					ProxyID: id,
+					Port:    ns.Port,
+					Proxy:   ns.Proxy,
+				}
+			}).
+			Return(nil).
+			Repeatability = 1
+
+		// Error on subsequent registrations afterwards (during the sync loop).
+		cfgMgr.On("Register", mock.Anything, mock.Anything, source, token, false).
+			Return(fmt.Errorf("intentional registration error"))
+
+		cfgMgr.On("Deregister", proxyID, source).
+			Run(func(mock.Arguments) { close(snapCh) }).
+			Return()
+	}
+
+	lim := NewMockSessionLimiter(t)
+	session1TermCh := make(limiter.SessionTerminatedChan)
+	session2TermCh := make(limiter.SessionTerminatedChan)
+	{
+		session1 := newMockSession(t)
+		session1.On("Terminated").Return(session1TermCh)
+		session1.On("End").Return()
+
+		session2 := newMockSession(t)
+		session2.On("Terminated").Return(session2TermCh)
+		session2.On("End").Return()
+
+		lim.On("BeginSession").Return(session1, nil).Once()
+		lim.On("BeginSession").Return(session2, nil).Once()
+	}
+
+	mgr := NewConfigSource(Config{
+		Manager:        cfgMgr,
+		LocalState:     testLocalState(t),
+		Logger:         hclog.NewNullLogger(),
+		GetStore:       func() Store { return store },
+		SessionLimiter: lim,
+	})
+	t.Cleanup(mgr.Shutdown)
+
+	snapCh, termCh, cfgSrcTerminated1, cancelWatch1, err := mgr.Watch(serviceID, nodeName, token)
+	require.NoError(t, err)
+	require.Equal(t, session1TermCh, termCh)
+
+	// Expect Register to have been called with the proxy's inital port.
+	select {
+	case snap := <-snapCh:
+		require.Equal(t, 9999, snap.Port)
+		require.Equal(t, token, snap.ProxyID.Token)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for snapshot")
+	}
+
+	// Start another watch.
+	_, termCh2, cfgSrcTerminated2, cancelWatch2, err := mgr.Watch(serviceID, nodeName, token)
+	require.NoError(t, err)
+	require.Equal(t, session2TermCh, termCh2)
+
+	// Expect the service to have not been re-registered by the second watch.
+	select {
+	case <-snapCh:
+		t.Fatal("service shouldn't have been re-registered")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Ensure that no config-source syncLoops were terminated.
+	select {
+	case <-cfgSrcTerminated1:
+		t.Fatal("unexpected config-source termination 1")
+	case <-cfgSrcTerminated2:
+		t.Fatal("unexpected config-source termination 2")
+	default:
+	}
+
+	// Update the proxy's port to 8888.
+	// This should trigger the config-source syncLoop termination channel due to an error.
+	require.NoError(t, store.EnsureRegistration(0, &structs.RegisterRequest{
+		Node: nodeName,
+		Service: &structs.NodeService{
+			ID:      serviceID.ID,
+			Service: "web-sidecar-proxy",
+			Port:    8888,
+			Kind:    structs.ServiceKindConnectProxy,
+			Proxy: structs.ConnectProxyConfig{
+				Config: map[string]any{
+					"local_connect_timeout_ms": 123,
+				},
+			},
+		},
+	}))
+
+	// Expect both config sources to have terminated when the syncLoop errors.
+	select {
+	case _, ok := <-cfgSrcTerminated1:
+		cancelWatch1()
+		require.False(t, ok)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for config-source termination 1")
+	}
+	select {
+	case _, ok := <-cfgSrcTerminated2:
+		cancelWatch2()
+		require.False(t, ok)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for config-source termination 2")
+	}
+
+	// Expect the snap channels to have been closed.
+	select {
+	case _, ok := <-snapCh:
+		require.False(t, ok)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("snap channel was not closed")
+	}
 }
 
 func TestConfigSource_NotProxyService(t *testing.T) {
@@ -258,7 +422,7 @@ func TestConfigSource_NotProxyService(t *testing.T) {
 	}))
 
 	var canceledWatch bool
-	cancel := proxycfg.CancelFunc(func() { canceledWatch = true })
+	cancel := context.CancelFunc(func() { canceledWatch = true })
 
 	cfgMgr := NewMockConfigManager(t)
 
@@ -274,7 +438,7 @@ func TestConfigSource_NotProxyService(t *testing.T) {
 	})
 	t.Cleanup(mgr.Shutdown)
 
-	_, _, _, err := mgr.Watch(serviceID, nodeName, token)
+	_, _, _, _, err := mgr.Watch(serviceID, nodeName, token)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must be a sidecar proxy or gateway")
 	require.True(t, canceledWatch, "watch should've been canceled")
@@ -290,7 +454,7 @@ func TestConfigSource_SessionLimiterError(t *testing.T) {
 	})
 	t.Cleanup(src.Shutdown)
 
-	_, _, _, err := src.Watch(
+	_, _, _, _, err := src.Watch(
 		structs.NewServiceID("web-sidecar-proxy-1", nil),
 		"node-name",
 		"token",
@@ -298,7 +462,7 @@ func TestConfigSource_SessionLimiterError(t *testing.T) {
 	require.Equal(t, limiter.ErrCapacityReached, err)
 }
 
-func testConfigManager(t *testing.T, serviceID structs.ServiceID, nodeName string, token string) ConfigManager {
+func testConfigManager(t *testing.T, serviceID structs.ServiceID, nodeName string, token string) *MockConfigManager {
 	t.Helper()
 
 	cfgMgr := NewMockConfigManager(t)
@@ -311,7 +475,7 @@ func testConfigManager(t *testing.T, serviceID structs.ServiceID, nodeName strin
 
 	snapCh := make(chan *proxycfg.ConfigSnapshot, 1)
 	cfgMgr.On("Watch", proxyID).
-		Return((<-chan *proxycfg.ConfigSnapshot)(snapCh), proxycfg.CancelFunc(func() {}), nil)
+		Return((<-chan *proxycfg.ConfigSnapshot)(snapCh), context.CancelFunc(func() {}), nil)
 
 	cfgMgr.On("Register", mock.Anything, mock.Anything, source, token, false).
 		Run(func(args mock.Arguments) {
@@ -354,6 +518,8 @@ type nullSessionLimiter struct{}
 func (nullSessionLimiter) BeginSession() (limiter.Session, error) {
 	return nullSession{}, nil
 }
+
+func (nullSessionLimiter) Run(ctx context.Context) {}
 
 type nullSession struct{}
 

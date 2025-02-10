@@ -1,5 +1,5 @@
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 # This Dockerfile contains multiple targets.
 # Use 'docker build --target=<name> .' to build one.
@@ -16,7 +16,7 @@
 # Official docker image that includes binaries from releases.hashicorp.com. This
 # downloads the release from releases.hashicorp.com and therefore requires that
 # the release is published before building the Docker image.
-FROM docker.mirror.hashicorp.services/alpine:3.17 as official
+FROM docker.mirror.hashicorp.services/alpine:3.21 as official
 
 # This is the release of Consul to pull in.
 ARG VERSION
@@ -29,6 +29,13 @@ LABEL org.opencontainers.image.authors="Consul Team <consul@hashicorp.com>" \
       org.opencontainers.image.vendor="HashiCorp" \
       org.opencontainers.image.title="consul" \
       org.opencontainers.image.description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      name="Consul" \
+      maintainer="Consul Team <consul@hashicorp.com>" \
+      vendor="HashiCorp" \
+      release=${PRODUCT_REVISION} \
+      revision=${PRODUCT_REVISION} \
+      summary="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
       version=${VERSION}
 
 # This is the location of the releases.
@@ -112,7 +119,7 @@ CMD ["agent", "-dev", "-client", "0.0.0.0"]
 
 # Production docker image that uses CI built binaries.
 # Remember, this image cannot be built locally.
-FROM docker.mirror.hashicorp.services/alpine:3.17 as default
+FROM docker.mirror.hashicorp.services/alpine:3.21 as default
 
 ARG PRODUCT_VERSION
 ARG BIN_NAME
@@ -123,7 +130,7 @@ ENV BIN_NAME=$BIN_NAME
 ENV PRODUCT_VERSION=$PRODUCT_VERSION
 
 ARG PRODUCT_REVISION
-ARG PRODUCT_NAME=$BIN_NAME
+ENV PRODUCT_NAME=$BIN_NAME
 
 # TARGETOS and TARGETARCH are set automatically when --platform is provided.
 ARG TARGETOS TARGETARCH
@@ -136,8 +143,17 @@ LABEL org.opencontainers.image.authors="Consul Team <consul@hashicorp.com>" \
       org.opencontainers.image.vendor="HashiCorp" \
       org.opencontainers.image.title="consul" \
       org.opencontainers.image.description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      org.opencontainers.image.licenses="BSL-1.1" \
+      name="Consul" \
+      maintainer="Consul Team <consul@hashicorp.com>" \
+      vendor="HashiCorp" \
+      release=${PRODUCT_REVISION} \
+      revision=${PRODUCT_REVISION} \
+      summary="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
       version=${PRODUCT_VERSION}
 
+COPY LICENSE /usr/share/doc/$PRODUCT_NAME/LICENSE.txt
 # Set up certificates and base tools.
 # libc6-compat is needed to symlink the shared libraries for ARM builds
 RUN apk add -v --no-cache \
@@ -201,9 +217,8 @@ CMD ["agent", "-dev", "-client", "0.0.0.0"]
 
 # Red Hat UBI-based image
 # This target is used to build a Consul image for use on OpenShift.
-FROM registry.access.redhat.com/ubi9-minimal:9.1.0 as ubi
+FROM registry.access.redhat.com/ubi9-minimal:9.5 as ubi
 
-ARG PRODUCT_NAME
 ARG PRODUCT_VERSION
 ARG PRODUCT_REVISION
 ARG BIN_NAME
@@ -212,8 +227,7 @@ ARG BIN_NAME
 # and the version to download. Example: PRODUCT_NAME=consul PRODUCT_VERSION=1.2.3.
 ENV BIN_NAME=$BIN_NAME
 ENV PRODUCT_VERSION=$PRODUCT_VERSION
-
-ARG PRODUCT_NAME=$BIN_NAME
+ENV PRODUCT_NAME=$BIN_NAME
 
 # TARGETOS and TARGETARCH are set automatically when --platform is provided.
 ARG TARGETOS TARGETARCH
@@ -226,14 +240,23 @@ LABEL org.opencontainers.image.authors="Consul Team <consul@hashicorp.com>" \
       org.opencontainers.image.vendor="HashiCorp" \
       org.opencontainers.image.title="consul" \
       org.opencontainers.image.description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      org.opencontainers.image.licenses="BSL-1.1" \
+      name="Consul" \
+      maintainer="Consul Team <consul@hashicorp.com>" \
+      vendor="HashiCorp" \
+      release=${PRODUCT_REVISION} \
+      revision=${PRODUCT_REVISION} \
+      summary="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
+      description="Consul is a datacenter runtime that provides service discovery, configuration, and orchestration." \
       version=${PRODUCT_VERSION}
 
+COPY LICENSE /usr/share/doc/$PRODUCT_NAME/LICENSE.txt
 # Copy license for Red Hat certification.
 COPY LICENSE /licenses/mozilla.txt
 
 # Set up certificates and base tools.
 # dumb-init is downloaded directly from GitHub because there's no RPM package.
-# Its shasum is hardcoded. If you upgrade the dumb-init verion you'll need to
+# Its shasum is hardcoded. If you upgrade the dumb-init version you'll need to
 # also update the shasum.
 RUN set -eux && \
     microdnf install -y ca-certificates shadow-utils gnupg libcap openssl iputils jq iptables wget unzip tar && \

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package acl
 
@@ -79,6 +79,10 @@ type Authorizer interface {
 
 	// IntentionDefaultAllow determines the default authorized behavior
 	// when no intentions match a Connect request.
+	//
+	// Deprecated: Use DefaultIntentionPolicy under agent configuration.
+	// Moving forwards, intentions will not inherit default allow behavior
+	// from the ACL system.
 	IntentionDefaultAllow(*AuthorizerContext) EnforcementDecision
 
 	// IntentionRead determines if a specific intention can be read.
@@ -157,6 +161,9 @@ type Authorizer interface {
 	// ServiceReadAll checks for permission to read all services
 	ServiceReadAll(*AuthorizerContext) EnforcementDecision
 
+	// ServiceReadPrefix checks for permission to read services within the given prefix.
+	ServiceReadPrefix(string, *AuthorizerContext) EnforcementDecision
+
 	// ServiceWrite checks for permission to create or update a given
 	// service
 	ServiceWrite(string, *AuthorizerContext) EnforcementDecision
@@ -173,6 +180,13 @@ type Authorizer interface {
 
 	// Snapshot checks for permission to take and restore snapshots.
 	Snapshot(*AuthorizerContext) EnforcementDecision
+
+	// TrafficPermissionsRead determines if specific traffic permissions can be read.
+	TrafficPermissionsRead(string, *AuthorizerContext) EnforcementDecision
+
+	// TrafficPermissionsWrite determines if specific traffic permissions can be
+	// created, modified, or deleted.
+	TrafficPermissionsWrite(string, *AuthorizerContext) EnforcementDecision
 
 	// Embedded Interface for Consul Enterprise specific ACL enforcement
 	enterpriseAuthorizer
@@ -239,17 +253,6 @@ func (a AllowAuthorizer) EventWriteAllowed(name string, ctx *AuthorizerContext) 
 	return nil
 }
 
-// IntentionDefaultAllowAllowed determines the default authorized behavior
-// when no intentions match a Connect request.
-func (a AllowAuthorizer) IntentionDefaultAllowAllowed(ctx *AuthorizerContext) error {
-	if a.Authorizer.IntentionDefaultAllow(ctx) != Allow {
-		// This is a bit nuanced, in that this isn't set by a rule, but inherited globally
-		// TODO(acl-error-enhancements) revisit when we have full accessor info
-		return PermissionDeniedError{Cause: "Denied by intention default"}
-	}
-	return nil
-}
-
 // IntentionReadAllowed determines if a specific intention can be read.
 func (a AllowAuthorizer) IntentionReadAllowed(name string, ctx *AuthorizerContext) error {
 	if a.Authorizer.IntentionRead(name, ctx) != Allow {
@@ -262,6 +265,23 @@ func (a AllowAuthorizer) IntentionReadAllowed(name string, ctx *AuthorizerContex
 // created, modified, or deleted.
 func (a AllowAuthorizer) IntentionWriteAllowed(name string, ctx *AuthorizerContext) error {
 	if a.Authorizer.IntentionWrite(name, ctx) != Allow {
+		return PermissionDeniedByACL(a, ctx, ResourceIntention, AccessWrite, name)
+	}
+	return nil
+}
+
+// TrafficPermissionsReadAllowed determines if specific traffic permissions can be read.
+func (a AllowAuthorizer) TrafficPermissionsReadAllowed(name string, ctx *AuthorizerContext) error {
+	if a.Authorizer.TrafficPermissionsRead(name, ctx) != Allow {
+		return PermissionDeniedByACL(a, ctx, ResourceIntention, AccessRead, name)
+	}
+	return nil
+}
+
+// TrafficPermissionsWriteAllowed determines if specific traffic permissions can be
+// created, modified, or deleted.
+func (a AllowAuthorizer) TrafficPermissionsWriteAllowed(name string, ctx *AuthorizerContext) error {
+	if a.Authorizer.TrafficPermissionsWrite(name, ctx) != Allow {
 		return PermissionDeniedByACL(a, ctx, ResourceIntention, AccessWrite, name)
 	}
 	return nil
@@ -431,6 +451,14 @@ func (a AllowAuthorizer) ServiceReadAllAllowed(ctx *AuthorizerContext) error {
 	if a.Authorizer.ServiceReadAll(ctx) != Allow {
 		// This is only used to gate certain UI functions right now (e.g metrics)
 		return PermissionDeniedByACL(a, ctx, ResourceService, AccessRead, "all services") // read
+	}
+	return nil
+}
+
+// ServiceReadPrefixAllowed checks for permission to read services within the given prefix
+func (a AllowAuthorizer) ServiceReadPrefixAllowed(prefix string, ctx *AuthorizerContext) error {
+	if a.Authorizer.ServiceReadPrefix(prefix, ctx) != Allow {
+		return PermissionDeniedByACL(a, ctx, ResourceService, AccessRead, prefix) // read
 	}
 	return nil
 }

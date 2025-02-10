@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -12,17 +12,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/acl"
-	"github.com/hashicorp/consul/api"
-
-	"github.com/hashicorp/serf/coordinate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/serf/coordinate"
+
+	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
 )
+
+func addQueryParam(req *http.Request, param, value string) {
+	q := req.URL.Query()
+	q.Add(param, value)
+	req.URL.RawQuery = q.Encode()
+}
 
 func TestCatalogRegister_PeeringRegistration(t *testing.T) {
 	if testing.Short() {
@@ -116,7 +122,7 @@ func TestCatalogDeregister(t *testing.T) {
 	a := NewTestAgent(t, "")
 	defer a.Shutdown()
 
-	// Register node
+	// Deregister node
 	args := &structs.DeregisterRequest{Node: "foo"}
 	req, _ := http.NewRequest("PUT", "/v1/catalog/deregister", jsonReader(args))
 	obj, err := a.srv.CatalogDeregister(nil, req)
@@ -1123,7 +1129,7 @@ func TestCatalogServiceNodes_DistanceSort(t *testing.T) {
 			r.Fatalf("err: %v", err)
 		}
 
-		assertIndex(t, resp)
+		assertIndex(r, resp)
 		nodes = obj.(structs.ServiceNodes)
 		if len(nodes) != 2 {
 			r.Fatalf("bad: %v", obj)
@@ -1894,11 +1900,12 @@ func TestCatalog_GatewayServices_Terminating(t *testing.T) {
 					SNI:      "my-domain",
 				},
 				{
-					Name:     "*",
-					CAFile:   "ca.crt",
-					CertFile: "client.crt",
-					KeyFile:  "client.key",
-					SNI:      "my-alt-domain",
+					Name:                   "*",
+					CAFile:                 "ca.crt",
+					CertFile:               "client.crt",
+					KeyFile:                "client.key",
+					SNI:                    "my-alt-domain",
+					DisableAutoHostRewrite: true,
 				},
 			},
 		},
@@ -1921,23 +1928,25 @@ func TestCatalog_GatewayServices_Terminating(t *testing.T) {
 
 		expect := structs.GatewayServices{
 			{
-				Service:     structs.NewServiceName("api", nil),
-				Gateway:     structs.NewServiceName("terminating", nil),
-				GatewayKind: structs.ServiceKindTerminatingGateway,
-				CAFile:      "api/ca.crt",
-				CertFile:    "api/client.crt",
-				KeyFile:     "api/client.key",
-				SNI:         "my-domain",
+				Service:         structs.NewServiceName("api", nil),
+				Gateway:         structs.NewServiceName("terminating", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				CAFile:          "api/ca.crt",
+				CertFile:        "api/client.crt",
+				KeyFile:         "api/client.key",
+				SNI:             "my-domain",
+				AutoHostRewrite: true,
 			},
 			{
-				Service:      structs.NewServiceName("redis", nil),
-				Gateway:      structs.NewServiceName("terminating", nil),
-				GatewayKind:  structs.ServiceKindTerminatingGateway,
-				CAFile:       "ca.crt",
-				CertFile:     "client.crt",
-				KeyFile:      "client.key",
-				SNI:          "my-alt-domain",
-				FromWildcard: true,
+				Service:         structs.NewServiceName("redis", nil),
+				Gateway:         structs.NewServiceName("terminating", nil),
+				GatewayKind:     structs.ServiceKindTerminatingGateway,
+				CAFile:          "ca.crt",
+				CertFile:        "client.crt",
+				KeyFile:         "client.key",
+				SNI:             "my-alt-domain",
+				FromWildcard:    true,
+				AutoHostRewrite: false,
 			},
 		}
 
@@ -2026,5 +2035,69 @@ func TestCatalog_GatewayServices_Ingress(t *testing.T) {
 			s.RaftIndex = structs.RaftIndex{}
 		}
 		require.Equal(r, expect, gatewayServices)
+	})
+}
+
+func TestCatalogRegister_AssignManualServiceVIPs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	a := NewTestAgent(t, "")
+	defer a.Shutdown()
+
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	for _, service := range []string{"api", "web"} {
+		req := structs.ConfigEntryRequest{
+			Datacenter: "dc1",
+			Entry: &structs.ServiceResolverConfigEntry{
+				Kind: structs.ServiceResolver,
+				Name: service,
+			},
+		}
+		var out bool
+		require.NoError(t, a.RPC(context.Background(), "ConfigEntry.Apply", &req, &out))
+	}
+
+	assignVIPs := func(req structs.AssignServiceManualVIPsRequest, expect structs.AssignServiceManualVIPsResponse) {
+		httpReq, _ := http.NewRequest("PUT", "/v1/internal/service-virtual-ip", jsonReader(req))
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.AssignManualServiceVIPs(resp, httpReq)
+		require.NoError(t, err)
+
+		result, ok := obj.(structs.AssignServiceManualVIPsResponse)
+		require.True(t, ok)
+		require.Equal(t, expect, result)
+	}
+
+	// Assign some manual IPs to the service
+	assignVIPs(structs.AssignServiceManualVIPsRequest{
+		Service:    "api",
+		ManualVIPs: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"},
+	}, structs.AssignServiceManualVIPsResponse{
+		Found: true,
+	})
+
+	// Assign some manual IPs to the new service, reassigning one from the existing service.
+	assignVIPs(structs.AssignServiceManualVIPsRequest{
+		Service:    "web",
+		ManualVIPs: []string{"2.2.2.2", "4.4.4.4"},
+	}, structs.AssignServiceManualVIPsResponse{
+		Found: true,
+		UnassignedFrom: []structs.PeeredServiceName{
+			{
+				ServiceName: structs.ServiceName{Name: "api", EnterpriseMeta: *acl.DefaultEnterpriseMeta()},
+			},
+		},
+	})
+
+	// Assign some manual IPs a non-existent service, should be a no-op.
+	assignVIPs(structs.AssignServiceManualVIPsRequest{
+		Service:    "nope",
+		ManualVIPs: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"},
+	}, structs.AssignServiceManualVIPsResponse{
+		Found: false,
 	})
 }

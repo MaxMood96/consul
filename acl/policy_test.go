@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package acl
 
@@ -341,6 +341,12 @@ func TestPolicySourceParse(t *testing.T) {
 			Rules:     `acl = "list"`,      // there is no list policy but this helps to exercise another check in isPolicyValid
 			RulesJSON: `{ "acl": "list" }`, // there is no list policy but this helps to exercise another check in isPolicyValid
 			Err:       "Invalid acl policy",
+		},
+		{
+			Name: "Bad Policy - Duplicate ACL Key",
+			Rules: `acl="read"
+					acl="write"`,
+			Err: "Failed to parse ACL rules: The argument \"acl\" at",
 		},
 		{
 			Name:      "Bad Policy - Agent",

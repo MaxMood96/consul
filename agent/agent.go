@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,10 +19,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/armon/go-metrics"
 	"github.com/armon/go-metrics/prometheus"
+	"github.com/rboyer/safeio"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
 	"github.com/hashicorp/go-connlimit"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
@@ -29,9 +37,6 @@ import (
 	"github.com/hashicorp/hcp-scada-provider/capability"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-	"google.golang.org/grpc"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/acl/resolver"
@@ -43,17 +48,18 @@ import (
 	"github.com/hashicorp/consul/agent/consul"
 	rpcRate "github.com/hashicorp/consul/agent/consul/rate"
 	"github.com/hashicorp/consul/agent/consul/servercert"
-	"github.com/hashicorp/consul/agent/dns"
 	external "github.com/hashicorp/consul/agent/grpc-external"
 	grpcDNS "github.com/hashicorp/consul/agent/grpc-external/services/dns"
 	middleware "github.com/hashicorp/consul/agent/grpc-middleware"
 	"github.com/hashicorp/consul/agent/hcp/scada"
-	libscada "github.com/hashicorp/consul/agent/hcp/scada"
+	"github.com/hashicorp/consul/agent/leafcert"
 	"github.com/hashicorp/consul/agent/local"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	proxycfgglue "github.com/hashicorp/consul/agent/proxycfg-glue"
 	catalogproxycfg "github.com/hashicorp/consul/agent/proxycfg-sources/catalog"
 	localproxycfg "github.com/hashicorp/consul/agent/proxycfg-sources/local"
+	"github.com/hashicorp/consul/agent/rpcclient"
+	"github.com/hashicorp/consul/agent/rpcclient/configentry"
 	"github.com/hashicorp/consul/agent/rpcclient/health"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/systemd"
@@ -61,12 +67,16 @@ import (
 	"github.com/hashicorp/consul/agent/xds"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/api/watch"
+	libdns "github.com/hashicorp/consul/internal/dnsutil"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/ipaddr"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/lib/file"
 	"github.com/hashicorp/consul/lib/mutex"
 	"github.com/hashicorp/consul/lib/routine"
 	"github.com/hashicorp/consul/logging"
+	"github.com/hashicorp/consul/proto-public/pbresource"
+	"github.com/hashicorp/consul/proto/private/pbconfigentry"
 	"github.com/hashicorp/consul/proto/private/pboperator"
 	"github.com/hashicorp/consul/proto/private/pbpeering"
 	"github.com/hashicorp/consul/tlsutil"
@@ -121,6 +131,7 @@ var configSourceToName = map[configSource]string{
 	ConfigSourceLocal:  "local",
 	ConfigSourceRemote: "remote",
 }
+
 var configSourceFromName = map[string]configSource{
 	"local":  ConfigSourceLocal,
 	"remote": ConfigSourceRemote,
@@ -176,7 +187,7 @@ type delegate interface {
 	// are ancillary members of.
 	//
 	// NOTE: This assumes coordinates are enabled, so check that before calling.
-	GetLANCoordinate() (lib.CoordinateSet, error)
+	GetLANCoordinate() (librtt.CoordinateSet, error)
 
 	// JoinLAN is used to have Consul join the inner-DC pool The target address
 	// should be another node inside the DC listening on the Serf LAN address
@@ -193,6 +204,9 @@ type delegate interface {
 
 	RPC(ctx context.Context, method string, args interface{}, reply interface{}) error
 
+	// ResourceServiceClient is a client for the gRPC Resource Service.
+	ResourceServiceClient() pbresource.ResourceServiceClient
+
 	SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.Writer, replyFn structs.SnapshotReplyFn) error
 	Shutdown() error
 	Stats() map[string]map[string]string
@@ -203,6 +217,14 @@ type delegate interface {
 // notifier is called after a successful JoinLAN.
 type notifier interface {
 	Notify(string) error
+}
+
+// dnsServer abstracts the implementations of the DNS server.
+type dnsServer interface {
+	GetAddr() string
+	ListenAndServe(string, string, func()) error
+	ReloadConfig(*config.RuntimeConfig) error
+	Shutdown()
 }
 
 // Agent is the long running process that is run on every machine.
@@ -217,6 +239,9 @@ type Agent struct {
 
 	// config is the agent configuration.
 	config *config.RuntimeConfig
+
+	displayOnlyConfigCopy     *config.RuntimeConfig
+	displayOnlyConfigCopyLock sync.Mutex
 
 	// Used for writing our logs
 	logger hclog.InterceptLogger
@@ -244,6 +269,9 @@ type Agent struct {
 
 	// cache is the in-memory cache for data the Agent requests.
 	cache *cache.Cache
+
+	// leafCertManager issues and caches leaf certs as needed.
+	leafCertManager *leafcert.Manager
 
 	// checkReapAfter maps the check ID to a timeout after which we should
 	// reap its associated service
@@ -321,7 +349,7 @@ type Agent struct {
 	endpointsLock sync.RWMutex
 
 	// dnsServer provides the DNS API
-	dnsServers []*DNSServer
+	dnsServers []dnsServer
 
 	// apiServers listening for connections. If any of these server goroutines
 	// fail, the agent will be shutdown.
@@ -382,9 +410,11 @@ type Agent struct {
 	// they can update their internal state.
 	configReloaders []ConfigReloader
 
-	// TODO: pass directly to HTTPHandlers and DNSServer once those are passed
+	// TODO: pass directly to HTTPHandlers and dnsServer once those are passed
 	// into Agent, which will allow us to remove this field.
-	rpcClientHealth *health.Client
+	rpcClientHealth       *health.Client
+	rpcClientConfigEntry  *configentry.Client
+	grpcClientConfigEntry pbconfigentry.ConfigEntryServiceClient
 
 	rpcClientPeering pbpeering.PeeringServiceClient
 
@@ -407,6 +437,8 @@ type Agent struct {
 
 	// enterpriseAgent embeds fields that we only access in consul-enterprise builds
 	enterpriseAgent
+
+	enableDebug atomic.Bool
 }
 
 // New process the desired options and creates a new Agent.
@@ -425,6 +457,12 @@ type Agent struct {
 //   - create the AutoConfig object for future use in fully
 //     resolving the configuration
 func New(bd BaseDeps) (*Agent, error) {
+	if bd.LeafCertManager == nil {
+		return nil, errors.New("LeafCertManager is required")
+	}
+	if bd.NetRPC == nil {
+		return nil, errors.New("NetRPC is required")
+	}
 	a := Agent{
 		checkReapAfter:  make(map[structs.CheckID]time.Duration),
 		checkMonitors:   make(map[structs.CheckID]*checks.CheckMonitor),
@@ -451,6 +489,7 @@ func New(bd BaseDeps) (*Agent, error) {
 		tlsConfigurator: bd.TLSConfigurator,
 		config:          bd.RuntimeConfig,
 		cache:           bd.Cache,
+		leafCertManager: bd.LeafCertManager,
 		routineManager:  routine.NewManager(bd.Logger),
 		scadaProvider:   bd.HCP.Provider,
 	}
@@ -462,22 +501,41 @@ func New(bd BaseDeps) (*Agent, error) {
 	}
 
 	a.rpcClientHealth = &health.Client{
-		Cache:     bd.Cache,
-		NetRPC:    &a,
-		CacheName: cachetype.HealthServicesName,
-		ViewStore: bd.ViewStore,
-		MaterializerDeps: health.MaterializerDeps{
-			Conn:   conn,
-			Logger: bd.Logger.Named("rpcclient.health"),
+		Client: rpcclient.Client{
+			Cache:     bd.Cache,
+			NetRPC:    &a,
+			CacheName: cachetype.HealthServicesName,
+			ViewStore: bd.ViewStore,
+			MaterializerDeps: rpcclient.MaterializerDeps{
+				Conn:   conn,
+				Logger: bd.Logger.Named("rpcclient.health"),
+			},
+			UseStreamingBackend: a.config.UseStreamingBackend,
+			QueryOptionDefaults: config.ApplyDefaultQueryOptions(a.config),
 		},
-		UseStreamingBackend: a.config.UseStreamingBackend,
-		QueryOptionDefaults: config.ApplyDefaultQueryOptions(a.config),
 	}
 
 	a.rpcClientPeering = pbpeering.NewPeeringServiceClient(conn)
 	a.rpcClientOperator = pboperator.NewOperatorServiceClient(conn)
+	a.grpcClientConfigEntry = pbconfigentry.NewConfigEntryServiceClient(conn)
 
 	a.serviceManager = NewServiceManager(&a)
+	a.rpcClientConfigEntry = &configentry.Client{
+		Client: rpcclient.Client{
+			Cache:     bd.Cache,
+			NetRPC:    &a,
+			CacheName: cachetype.ConfigEntryName,
+			ViewStore: bd.ViewStore,
+			MaterializerDeps: rpcclient.MaterializerDeps{
+				Conn:   conn,
+				Logger: bd.Logger.Named("rpcclient.configentry"),
+			},
+			QueryOptionDefaults: config.ApplyDefaultQueryOptions(a.config),
+		},
+	}
+
+	// TODO(rb): remove this once NetRPC is properly available in BaseDeps without an Agent
+	bd.NetRPC.SetNetRPC(&a)
 
 	// We used to do this in the Start method. However it doesn't need to go
 	// there any longer. Originally it did because we passed the agent
@@ -557,12 +615,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		return err
 	}
 
-	// copy over the existing node id, this cannot be
-	// changed while running anyways but this prevents
-	// breaking some existing behavior. then overwrite
-	// the configuration
+	// Copy over the existing node id. This cannot be
+	// changed while running, but this prevents
+	// breaking some existing behavior.
 	c.NodeID = a.config.NodeID
+	// Overwrite the configuration.
 	a.config = c
+
+	a.enableDebug.Store(c.EnableDebug)
 
 	if err := a.tlsConfigurator.Update(a.config.TLS); err != nil {
 		return fmt.Errorf("Failed to load TLS configurations after applying auto-config settings: %w", err)
@@ -578,6 +638,12 @@ func (a *Agent) Start(ctx context.Context) error {
 	// create the state synchronization manager which performs
 	// regular and on-demand state synchronizations (anti-entropy).
 	a.sync = ae.NewStateSyncer(a.State, c.AEInterval, a.shutdownCh, a.logger)
+
+	err = validateFIPSConfig(a.config)
+	if err != nil {
+		// Log warning, rather than force breaking
+		a.logger.Warn("FIPS 140-2 Compliance", "issue", err)
+	}
 
 	// create the config for the rpc server/client
 	consulCfg, err := newConsulConfig(a.config, a.logger)
@@ -604,8 +670,25 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	// Setup either the client or the server.
+	var consulServer *consul.Server
 	if c.ServerMode {
 		serverLogger := a.baseDeps.Logger.NamedIntercept(logging.ConsulServer)
+
+		// Check for a last seen timestamp and exit if deemed stale before attempting to join
+		// Serf/Raft or listen for requests.
+		if err := a.checkServerLastSeen(consul.ReadServerMetadata); err != nil {
+			deadline := time.Now().Add(time.Minute)
+			for time.Now().Before(deadline) {
+				a.logger.Error("startup error", "error", err)
+				time.Sleep(10 * time.Second)
+			}
+			return err
+		}
+
+		// Periodically write server metadata to disk.
+		if !consulCfg.DevMode {
+			go a.persistServerMetadata()
+		}
 
 		incomingRPCLimiter := consul.ConfiguredIncomingRPCLimiter(
 			&lib.StopChannelContext{StopCh: a.shutdownCh},
@@ -618,14 +701,19 @@ func (a *Agent) Start(ctx context.Context) error {
 			metrics.Default(),
 			a.tlsConfigurator,
 			incomingRPCLimiter,
+			keepalive.ServerParameters{
+				Time:    a.config.GRPCKeepaliveInterval,
+				Timeout: a.config.GRPCKeepaliveTimeout,
+			},
+			nil,
 		)
 
-		server, err := consul.NewServer(consulCfg, a.baseDeps.Deps, a.externalGRPCServer, incomingRPCLimiter, serverLogger)
+		consulServer, err = consul.NewServer(consulCfg, a.baseDeps.Deps, a.externalGRPCServer, incomingRPCLimiter, serverLogger)
 		if err != nil {
 			return fmt.Errorf("Failed to start Consul server: %v", err)
 		}
-		incomingRPCLimiter.Register(server)
-		a.delegate = server
+		incomingRPCLimiter.Register(consulServer)
+		a.delegate = consulServer
 
 		if a.config.PeeringEnabled && a.config.ConnectEnabled {
 			d := servercert.Deps{
@@ -634,8 +722,8 @@ func (a *Agent) Start(ctx context.Context) error {
 					Datacenter:  a.config.Datacenter,
 					ACLsEnabled: a.config.ACLsEnabled,
 				},
-				Cache:           a.cache,
-				GetStore:        func() servercert.Store { return server.FSM().State() },
+				LeafCertManager: a.leafCertManager,
+				GetStore:        func() servercert.Store { return consulServer.FSM().State() },
 				TLSConfigurator: a.tlsConfigurator,
 			}
 			a.certManager = servercert.NewCertManager(d)
@@ -643,13 +731,22 @@ func (a *Agent) Start(ctx context.Context) error {
 				return fmt.Errorf("failed to start server cert manager: %w", err)
 			}
 		}
-
 	} else {
+		// the conn is used to connect to the consul server agent
+		conn, err := a.baseDeps.GRPCConnPool.ClientConn(a.baseDeps.RuntimeConfig.Datacenter)
+		if err != nil {
+			return err
+		}
 		a.externalGRPCServer = external.NewServer(
 			a.logger.Named("grpc.external"),
 			metrics.Default(),
 			a.tlsConfigurator,
 			rpcRate.NullRequestLimitsHandler(),
+			keepalive.ServerParameters{
+				Time:    a.config.GRPCKeepaliveInterval,
+				Timeout: a.config.GRPCKeepaliveTimeout,
+			},
+			conn,
 		)
 
 		client, err := consul.NewClient(consulCfg, a.baseDeps.Deps)
@@ -688,27 +785,32 @@ func (a *Agent) Start(ctx context.Context) error {
 		return err
 	}
 
-	var intentionDefaultAllow bool
-	switch a.config.ACLResolverSettings.ACLDefaultPolicy {
+	intentionDefaultAllow, err := a.config.ACLResolverSettings.IsDefaultAllow()
+	if err != nil {
+		return fmt.Errorf("unexpected ACL default policy value of %q", a.config.ACLResolverSettings.ACLDefaultPolicy)
+	}
+
+	// If DefaultIntentionPolicy is defined, it should override
+	// the values inherited from ACLDefaultPolicy.
+	switch a.config.DefaultIntentionPolicy {
 	case "allow":
 		intentionDefaultAllow = true
 	case "deny":
 		intentionDefaultAllow = false
-	default:
-		return fmt.Errorf("unexpected ACL default policy value of %q", a.config.ACLResolverSettings.ACLDefaultPolicy)
 	}
 
 	go a.baseDeps.ViewStore.Run(&lib.StopChannelContext{StopCh: a.shutdownCh})
 
 	// Start the proxy config manager.
 	a.proxyConfig, err = proxycfg.NewManager(proxycfg.ManagerConfig{
-		DataSources: a.proxyDataSources(),
+		DataSources: a.proxyDataSources(consulServer),
 		Logger:      a.logger.Named(logging.ProxyConfig),
 		Source: &structs.QuerySource{
 			Datacenter:    a.config.Datacenter,
 			Segment:       a.config.SegmentName,
 			Node:          a.config.NodeName,
 			NodePartition: a.config.PartitionOrEmpty(),
+			DisableNode:   true, // Disable for agentless so that streaming RPCs can be used.
 		},
 		DNSConfig: proxycfg.DNSConfig{
 			Domain:    a.config.DNSDomain,
@@ -730,6 +832,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			Logger:          a.proxyConfig.Logger.Named("agent-state"),
 			Tokens:          a.baseDeps.Tokens,
 			NodeName:        a.config.NodeName,
+			NodeLocality:    a.config.StructLocality(),
 			ResyncFrequency: a.config.LocalProxyConfigResyncInterval,
 		},
 	)
@@ -774,7 +877,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	// Start grpc and grpc_tls servers.
-	if err := a.listenAndServeGRPC(); err != nil {
+	if err := a.listenAndServeGRPC(consulServer); err != nil {
 		return err
 	}
 
@@ -797,12 +900,6 @@ func (a *Agent) Start(ctx context.Context) error {
 		go m.Monitor(&lib.StopChannelContext{StopCh: a.shutdownCh})
 	}
 
-	// consul version metric with labels
-	metrics.SetGaugeWithLabels([]string{"version"}, 1, []metrics.Label{
-		{Name: "version", Value: a.config.VersionWithMetadata()},
-		{Name: "pre_release", Value: a.config.VersionPrerelease},
-	})
-
 	// start a go routine to reload config based on file watcher events
 	if a.configFileWatcher != nil {
 		a.baseDeps.Logger.Debug("starting file watcher")
@@ -816,17 +913,6 @@ func (a *Agent) Start(ctx context.Context) error {
 				}
 			}
 		}()
-	}
-
-	if a.scadaProvider != nil {
-		a.scadaProvider.UpdateMeta(map[string]string{
-			"consul_server_id": string(a.config.NodeID),
-		})
-
-		if err = a.scadaProvider.Start(); err != nil {
-			a.baseDeps.Logger.Error("scada provider failed to start, some HashiCorp Cloud Platform functionality has been disabled",
-				"error", err, "resource_id", a.config.Cloud.ResourceID)
-		}
 	}
 
 	return nil
@@ -845,18 +931,17 @@ func (a *Agent) Failed() <-chan struct{} {
 	return a.apiServers.failed
 }
 
-func (a *Agent) listenAndServeGRPC() error {
-	if len(a.config.GRPCAddrs) < 1 && len(a.config.GRPCTLSAddrs) < 1 {
-		return nil
-	}
+// configureXDSServer configures an XDS server with the proper implementation of
+// the PRoxyWatcher interface and registers the XDS server with Consul's
+// external facing GRPC server.
+func (a *Agent) configureXDSServer(proxyWatcher xds.ProxyWatcher, server *consul.Server) {
 	// TODO(agentless): rather than asserting the concrete type of delegate, we
 	// should add a method to the Delegate interface to build a ConfigSource.
-	var cfg xds.ProxyConfigSource = localproxycfg.NewConfigSource(a.proxyConfig)
-	if server, ok := a.delegate.(*consul.Server); ok {
+	if server != nil {
 		catalogCfg := catalogproxycfg.NewConfigSource(catalogproxycfg.Config{
 			NodeName:          a.config.NodeName,
 			LocalState:        a.State,
-			LocalConfigSource: cfg,
+			LocalConfigSource: proxyWatcher,
 			Manager:           a.proxyConfig,
 			GetStore:          func() catalogproxycfg.Store { return server.FSM().State() },
 			Logger:            a.proxyConfig.Logger.Named("server-catalog"),
@@ -866,18 +951,27 @@ func (a *Agent) listenAndServeGRPC() error {
 			<-a.shutdownCh
 			catalogCfg.Shutdown()
 		}()
-		cfg = catalogCfg
+		proxyWatcher = catalogCfg
 	}
 	a.xdsServer = xds.NewServer(
 		a.config.NodeName,
 		a.logger.Named(logging.Envoy),
-		cfg,
+		proxyWatcher,
 		func(id string) (acl.Authorizer, error) {
 			return a.delegate.ResolveTokenAndDefaultMeta(id, nil, nil)
 		},
 		a,
 	)
 	a.xdsServer.Register(a.externalGRPCServer)
+}
+
+func (a *Agent) listenAndServeGRPC(server *consul.Server) error {
+	if len(a.config.GRPCAddrs) < 1 && len(a.config.GRPCTLSAddrs) < 1 {
+		return nil
+	}
+	var proxyWatcher xds.ProxyWatcher = localproxycfg.NewConfigSource(a.proxyConfig)
+
+	a.configureXDSServer(proxyWatcher, server)
 
 	// Attempt to spawn listeners
 	var listeners []net.Listener
@@ -1072,13 +1166,13 @@ func (a *Agent) listenHTTP() ([]apiServer, error) {
 			httpServer := &http.Server{
 				Addr:           l.Addr().String(),
 				TLSConfig:      tlscfg,
-				Handler:        srv.handler(a.config.EnableDebug),
+				Handler:        srv.handler(),
 				MaxHeaderBytes: a.config.HTTPMaxHeaderBytes,
 			}
 
-			if libscada.IsCapability(l.Addr()) {
+			if scada.IsCapability(l.Addr()) {
 				// wrap in http2 server handler
-				httpServer.Handler = h2c.NewHandler(srv.handler(a.config.EnableDebug), &http2.Server{})
+				httpServer.Handler = h2c.NewHandler(srv.handler(), &http2.Server{})
 			}
 
 			// Load the connlimit helper into the server
@@ -1098,7 +1192,7 @@ func (a *Agent) listenHTTP() ([]apiServer, error) {
 	}
 
 	httpAddrs := a.config.HTTPAddrs
-	if a.config.IsCloudEnabled() {
+	if a.config.IsCloudEnabled() && a.scadaProvider != nil {
 		httpAddrs = append(httpAddrs, scada.CAPCoreAPI)
 	}
 
@@ -1340,6 +1434,9 @@ func newConsulConfig(runtimeCfg *config.RuntimeConfig, logger hclog.Logger) (*co
 	cfg.GRPCTLSPort = runtimeCfg.GRPCTLSPort
 
 	cfg.Segment = runtimeCfg.SegmentName
+
+	cfg.RaftConfig.PreVoteDisabled = runtimeCfg.RaftPreVoteDisabled
+
 	if len(runtimeCfg.Segments) > 0 {
 		segments, err := segmentConfig(runtimeCfg)
 		if err != nil {
@@ -1499,7 +1596,11 @@ func newConsulConfig(runtimeCfg *config.RuntimeConfig, logger hclog.Logger) (*co
 	cfg.RequestLimitsWriteRate = runtimeCfg.RequestLimitsWriteRate
 	cfg.Locality = runtimeCfg.StructLocality()
 
+	cfg.Cloud = runtimeCfg.Cloud
+
 	cfg.Reporting.License.Enabled = runtimeCfg.Reporting.License.Enabled
+
+	cfg.ServerRejoinAgeMax = runtimeCfg.ServerRejoinAgeMax
 
 	enterpriseConsulConfig(cfg, runtimeCfg)
 
@@ -1578,7 +1679,18 @@ func (a *Agent) RPC(ctx context.Context, method string, args interface{}, reply 
 			method = e + "." + p[1]
 		}
 	}
+
+	// audit log only on consul clients
+	_, ok := a.delegate.(*consul.Client)
+	if ok {
+		a.writeAuditRPCEvent(method, "OperationStart")
+	}
+
 	a.endpointsLock.RUnlock()
+
+	defer func() {
+		a.writeAuditRPCEvent(method, "OperationComplete")
+	}()
 	return a.delegate.RPC(ctx, method, args, reply)
 }
 
@@ -1662,6 +1774,7 @@ func (a *Agent) ShutdownAgent() error {
 	}
 
 	a.rpcClientHealth.Close()
+	a.rpcClientConfigEntry.Close()
 
 	// Shutdown SCADA provider
 	if a.scadaProvider != nil {
@@ -1699,14 +1812,7 @@ func (a *Agent) ShutdownEndpoints() {
 	ctx := context.TODO()
 
 	for _, srv := range a.dnsServers {
-		if srv.Server != nil {
-			a.logger.Info("Stopping server",
-				"protocol", "DNS",
-				"address", srv.Server.Addr,
-				"network", srv.Server.Net,
-			)
-			srv.Shutdown()
-		}
+		srv.Shutdown()
 	}
 	a.dnsServers = nil
 
@@ -1918,7 +2024,7 @@ func (a *Agent) SyncPausedCh() <-chan struct{} {
 
 // GetLANCoordinate returns the coordinates of this node in the local pools
 // (assumes coordinates are enabled, so check that before calling).
-func (a *Agent) GetLANCoordinate() (lib.CoordinateSet, error) {
+func (a *Agent) GetLANCoordinate() (librtt.CoordinateSet, error) {
 	return a.delegate.GetLANCoordinate()
 }
 
@@ -2541,13 +2647,13 @@ func (a *Agent) validateService(service *structs.NodeService, chkTypes []*struct
 	}
 
 	// Warn if the service name is incompatible with DNS
-	if dns.InvalidNameRe.MatchString(service.Service) {
+	if libdns.InvalidNameRe.MatchString(service.Service) {
 		a.logger.Warn("Service name will not be discoverable "+
 			"via DNS due to invalid characters. Valid characters include "+
 			"all alpha-numerics and dashes.",
 			"service", service.Service,
 		)
-	} else if len(service.Service) > dns.MaxLabelLength {
+	} else if len(service.Service) > libdns.MaxLabelLength {
 		a.logger.Warn("Service name will not be discoverable "+
 			"via DNS due to it being too long. Valid lengths are between "+
 			"1 and 63 bytes.",
@@ -2557,13 +2663,13 @@ func (a *Agent) validateService(service *structs.NodeService, chkTypes []*struct
 
 	// Warn if any tags are incompatible with DNS
 	for _, tag := range service.Tags {
-		if dns.InvalidNameRe.MatchString(tag) {
+		if libdns.InvalidNameRe.MatchString(tag) {
 			a.logger.Debug("Service tag will not be discoverable "+
 				"via DNS due to invalid characters. Valid characters include "+
 				"all alpha-numerics and dashes.",
 				"tag", tag,
 			)
-		} else if len(tag) > dns.MaxLabelLength {
+		} else if len(tag) > libdns.MaxLabelLength {
 			a.logger.Debug("Service tag will not be discoverable "+
 				"via DNS due to it being too long. Valid lengths are between "+
 				"1 and 63 bytes.",
@@ -2942,14 +3048,20 @@ func (a *Agent) addCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 				chkType.Interval = checks.MinInterval
 			}
 
+			var tlsClientConfig *tls.Config
+			if chkType.TCPUseTLS {
+				tlsClientConfig = a.tlsConfigurator.OutgoingTLSConfigForCheck(chkType.TLSSkipVerify, chkType.TLSServerName)
+			}
+
 			tcp := &checks.CheckTCP{
-				CheckID:       cid,
-				ServiceID:     sid,
-				TCP:           chkType.TCP,
-				Interval:      chkType.Interval,
-				Timeout:       chkType.Timeout,
-				Logger:        a.logger,
-				StatusHandler: statusHandler,
+				CheckID:         cid,
+				ServiceID:       sid,
+				TCP:             chkType.TCP,
+				Interval:        chkType.Interval,
+				Timeout:         chkType.Timeout,
+				Logger:          a.logger,
+				TLSClientConfig: tlsClientConfig,
+				StatusHandler:   statusHandler,
 			}
 			tcp.Start()
 			a.checkTCPs[cid] = tcp
@@ -3567,6 +3679,13 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig, snap map[structs.CheckI
 		}
 
 		ns := service.NodeService()
+
+		// We currently do not persist locality inherited from the node service
+		// (it is inherited at runtime). See agent/proxycfg-sources/local/sync.go.
+		// To support locality-aware service discovery in the future, persisting
+		// this data may be necessary. This does not impact agent-less deployments
+		// because locality is explicitly set on service registration there.
+
 		chkTypes, err := service.CheckTypes()
 		if err != nil {
 			return fmt.Errorf("Failed to validate checks for service %q: %v", service.Name, err)
@@ -3676,7 +3795,7 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig, snap map[structs.CheckI
 		}
 
 		if acl.EqualPartitions("", p.Service.PartitionOrEmpty()) {
-			// NOTE: in case loading a service with empty partition (e.g., OSS -> ENT),
+			// NOTE: in case loading a service with empty partition (e.g., CE -> ENT),
 			// we always default the service partition to the agent's partition.
 			p.Service.OverridePartition(a.AgentEnterpriseMeta().PartitionOrDefault())
 		} else if !acl.EqualPartitions(a.AgentEnterpriseMeta().PartitionOrDefault(), p.Service.PartitionOrDefault()) {
@@ -3924,6 +4043,7 @@ func (a *Agent) loadMetadata(conf *config.RuntimeConfig) error {
 		meta[k] = v
 	}
 	meta[structs.MetaSegmentKey] = conf.SegmentName
+	meta[structs.MetaConsulVersion] = conf.Version
 	return a.State.LoadMetadata(meta)
 }
 
@@ -4220,7 +4340,24 @@ func (a *Agent) reloadConfigInternal(newCfg *config.RuntimeConfig) error {
 
 	a.proxyConfig.SetUpdateRateLimit(newCfg.XDSUpdateRateLimit)
 
+	a.enableDebug.Store(newCfg.EnableDebug)
+	a.config.EnableDebug = newCfg.EnableDebug
+
+	// update Agent config with new config
+	a.displayOnlyConfigCopyLock.Lock()
+	a.displayOnlyConfigCopy = newCfg.DeepCopy()
+	a.displayOnlyConfigCopyLock.Unlock()
+
 	return nil
+}
+
+func (a *Agent) getRuntimeConfigForDisplay() *config.RuntimeConfig {
+	a.displayOnlyConfigCopyLock.Lock()
+	defer a.displayOnlyConfigCopyLock.Unlock()
+	if a.displayOnlyConfigCopy != nil {
+		return a.displayOnlyConfigCopy.DeepCopy()
+	}
+	return a.config
 }
 
 // LocalBlockingQuery performs a blocking query in a generic way against
@@ -4298,13 +4435,6 @@ func (a *Agent) registerCache() {
 	// routing via a.registerEndpoint will not work.
 
 	a.cache.RegisterType(cachetype.ConnectCARootName, &cachetype.ConnectCARoot{RPC: a})
-
-	a.cache.RegisterType(cachetype.ConnectCALeafName, &cachetype.ConnectCALeaf{
-		RPC:                              a,
-		Cache:                            a.cache,
-		Datacenter:                       a.config.Datacenter,
-		TestOverrideCAChangeInitialDelay: a.config.ConnectTestCALeafRootChangeSpread,
-	})
 
 	a.cache.RegisterType(cachetype.IntentionMatchName, &cachetype.IntentionMatch{RPC: a})
 
@@ -4450,7 +4580,7 @@ func (a *Agent) listenerPortLocked(svcID structs.ServiceID, checkID structs.Chec
 	return port, nil
 }
 
-func (a *Agent) proxyDataSources() proxycfg.DataSources {
+func (a *Agent) proxyDataSources(server *consul.Server) proxycfg.DataSources {
 	sources := proxycfg.DataSources{
 		CARoots:                         proxycfgglue.CacheCARoots(a.cache),
 		CompiledDiscoveryChain:          proxycfgglue.CacheCompiledDiscoveryChain(a.cache),
@@ -4466,7 +4596,7 @@ func (a *Agent) proxyDataSources() proxycfg.DataSources {
 		IntentionUpstreams:              proxycfgglue.CacheIntentionUpstreams(a.cache),
 		IntentionUpstreamsDestination:   proxycfgglue.CacheIntentionUpstreamsDestination(a.cache),
 		InternalServiceDump:             proxycfgglue.CacheInternalServiceDump(a.cache),
-		LeafCertificate:                 proxycfgglue.CacheLeafCertificate(a.cache),
+		LeafCertificate:                 proxycfgglue.LocalLeafCerts(a.leafCertManager),
 		PeeredUpstreams:                 proxycfgglue.CachePeeredUpstreams(a.cache),
 		PeeringList:                     proxycfgglue.CachePeeringList(a.cache),
 		PreparedQuery:                   proxycfgglue.CachePrepraredQuery(a.cache),
@@ -4477,7 +4607,7 @@ func (a *Agent) proxyDataSources() proxycfg.DataSources {
 		ExportedPeeredServices:          proxycfgglue.CacheExportedPeeredServices(a.cache),
 	}
 
-	if server, ok := a.delegate.(*consul.Server); ok {
+	if server != nil {
 		deps := proxycfgglue.ServerDataSourceDeps{
 			Datacenter:     a.config.Datacenter,
 			EventPublisher: a.baseDeps.EventPublisher,
@@ -4492,11 +4622,15 @@ func (a *Agent) proxyDataSources() proxycfg.DataSources {
 		sources.ExportedPeeredServices = proxycfgglue.ServerExportedPeeredServices(deps)
 		sources.FederationStateListMeshGateways = proxycfgglue.ServerFederationStateListMeshGateways(deps)
 		sources.GatewayServices = proxycfgglue.ServerGatewayServices(deps)
-		sources.Health = proxycfgglue.ServerHealth(deps, proxycfgglue.ClientHealth(a.rpcClientHealth))
+		// We do not use this health check currently due to a bug with the way that service exports
+		// interact with ACLs and the streaming backend. See comments in `proxycfgglue.ServerHealthBlocking`
+		// for more details.
+		// sources.Health = proxycfgglue.ServerHealth(deps, proxycfgglue.ClientHealth(a.rpcClientHealth))
+		sources.Health = proxycfgglue.ServerHealthBlocking(deps, proxycfgglue.ClientHealth(a.rpcClientHealth))
 		sources.HTTPChecks = proxycfgglue.ServerHTTPChecks(deps, a.config.NodeName, proxycfgglue.CacheHTTPChecks(a.cache), a.State)
 		sources.Intentions = proxycfgglue.ServerIntentions(deps)
-		sources.IntentionUpstreams = proxycfgglue.ServerIntentionUpstreams(deps)
-		sources.IntentionUpstreamsDestination = proxycfgglue.ServerIntentionUpstreamsDestination(deps)
+		sources.IntentionUpstreams = proxycfgglue.ServerIntentionUpstreams(deps, a.config.DefaultIntentionPolicy)
+		sources.IntentionUpstreamsDestination = proxycfgglue.ServerIntentionUpstreamsDestination(deps, a.config.DefaultIntentionPolicy)
 		sources.InternalServiceDump = proxycfgglue.ServerInternalServiceDump(deps, proxycfgglue.CacheInternalServiceDump(a.cache))
 		sources.PeeringList = proxycfgglue.ServerPeeringList(deps)
 		sources.PeeredUpstreams = proxycfgglue.ServerPeeredUpstreams(deps)
@@ -4508,7 +4642,78 @@ func (a *Agent) proxyDataSources() proxycfg.DataSources {
 
 	a.fillEnterpriseProxyDataSources(&sources)
 	return sources
+}
 
+// persistServerMetadata periodically writes a server's metadata to a file
+// in the configured data directory.
+func (a *Agent) persistServerMetadata() {
+	file := filepath.Join(a.config.DataDir, consul.ServerMetadataFile)
+
+	// Create a timer with no initial tick to allow metadata to be written immediately.
+	t := time.NewTimer(0)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-t.C:
+			// Reset the timer to the larger periodic interval.
+			t.Reset(1 * time.Hour)
+
+			f, err := consul.OpenServerMetadata(file)
+			if err != nil {
+				a.logger.Error("failed to open existing server metadata", "error", err)
+				continue
+			}
+
+			if err := consul.WriteServerMetadata(f); err != nil {
+				f.Close()
+				a.logger.Error("failed to write server metadata", "error", err)
+				continue
+			}
+
+			// Use safeio.File to ensure the file is written to disk atomically
+			if sf, ok := f.(*safeio.File); ok {
+				if err := sf.Commit(); err != nil {
+					sf.Close()
+					a.logger.Error("failed to commit server metadata", "error", err)
+					continue
+				}
+			}
+			f.Close()
+		case <-a.shutdownCh:
+			return
+		}
+	}
+}
+
+// checkServerLastSeen is a safety check that only occurs once of startup to prevent old servers
+// with stale data from rejoining an existing cluster.
+//
+// It attempts to read a server's metadata file and check the last seen Unix timestamp against a
+// configurable max age. If the metadata file does not exist, we treat this as an initial startup
+// and return no error.
+//
+// Example: if the server recorded a last seen timestamp of now-7d, and we configure a max age
+// of 3d, then we should prevent the server from rejoining.
+func (a *Agent) checkServerLastSeen(readFn consul.ServerMetadataReadFunc) error {
+	filename := filepath.Join(a.config.DataDir, consul.ServerMetadataFile)
+
+	// Read server metadata file.
+	md, err := readFn(filename)
+	if err != nil {
+		// Return early if it doesn't exist as this likely indicates the server is starting for the first time.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("error reading server metadata: %w", err)
+	}
+
+	maxAge := a.config.ServerRejoinAgeMax
+	if md.IsLastSeenStale(maxAge) {
+		return fmt.Errorf("refusing to rejoin cluster because server has been offline for more than the configured server_rejoin_age_max (%s) - consider wiping your data dir", maxAge)
+	}
+
+	return nil
 }
 
 func listenerPortKey(svcID structs.ServiceID, checkID structs.CheckID) string {
@@ -4558,4 +4763,14 @@ func defaultIfEmpty(val, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+func (a *Agent) getTokenFunc() func() string {
+	return func() string {
+		if a.tokens.DNSToken() != "" {
+			return a.tokens.DNSToken()
+		} else {
+			return a.tokens.UserToken()
+		}
+	}
 }

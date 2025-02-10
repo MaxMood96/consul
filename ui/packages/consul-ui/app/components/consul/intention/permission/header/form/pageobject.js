@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 import { input } from 'consul-ui/tests/lib/page-object';
@@ -11,7 +11,14 @@ export default (scope = '.consul-intention-permission-header-form') => {
     scope: scope,
     HeaderType: {
       scope: '[data-property="headertype"]',
-      ...powerSelect(['ExactlyMatching', 'PrefixedBy', 'SuffixedBy', 'RegEx', 'IsPresent']),
+      ...powerSelect([
+        'ExactlyMatching',
+        'PrefixedBy',
+        'SuffixedBy',
+        'Containing',
+        'RegEx',
+        'IsPresent',
+      ]),
     },
     Name: {
       scope: '[data-property="name"] input',

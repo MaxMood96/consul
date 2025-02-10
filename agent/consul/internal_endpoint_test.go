@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul-net-rpc/net/rpc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	msgpackrpc "github.com/hashicorp/consul-net-rpc/net-rpc-msgpackrpc"
+	"github.com/hashicorp/consul-net-rpc/net/rpc"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/structs"
@@ -656,11 +656,73 @@ func TestInternal_NodeDump_FilterACL(t *testing.T) {
 		t.Fatal("ResultsFilteredByACLs should be true")
 	}
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	// need to ensure that ACLs are filtered prior to bexprFiltering
+	// Register additional node
+	regArgs := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		WriteRequest: structs.WriteRequest{
+			Token: "root",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", regArgs, &out))
+
+	bexprMatchingUserTokenPermissions := fmt.Sprintf("Node matches `%s.*`", srv.config.NodeName)
+	const bexpNotMatchingUserTokenPermissions = "Node matches `node-deny.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodeDump{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.NodeDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.Dump))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodeDump{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.NodeDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.Dump))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would match only record without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  "",
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodeDump{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.NodeDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Empty(t, reply.Dump)
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestInternal_EventFire_Token(t *testing.T) {
@@ -1064,6 +1126,113 @@ func TestInternal_ServiceDump_ACL(t *testing.T) {
 		require.Empty(t, out.Gateways)
 		require.True(t, out.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 	})
+
+	// need to ensure that ACLs are filtered prior to bexprFiltering
+	// Register additional node
+	regArgs := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "node-deny",
+		ID:         types.NodeID("e0155642-135d-4739-9853-b1ee6c9f945b"),
+		Address:    "192.18.1.2",
+		Service: &structs.NodeService{
+			Kind:    structs.ServiceKindTypical,
+			ID:      "memcached",
+			Service: "memcached",
+			Port:    5678,
+		},
+		Check: &structs.HealthCheck{
+			Name:      "memcached check",
+			Status:    api.HealthPassing,
+			ServiceID: "memcached",
+		},
+		WriteRequest: structs.WriteRequest{
+			Token: "root",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", regArgs, &out))
+
+	const (
+		bexprMatchingUserTokenPermissions   = "Service.Service matches `redis.*`"
+		bexpNotMatchingUserTokenPermissions = "Node.Node matches `node-deny.*`"
+	)
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		token := tokenWithRules(t, `
+			node "node-deny" {
+				policy = "deny"
+			}
+			node "node1" {
+				policy = "read"
+			}
+			service "redis" {
+				policy = "read"
+			}
+		`)
+		var reply structs.IndexedNodesWithGateways
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodesWithGateways{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.ServiceDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.Nodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		token := tokenWithRules(t, `
+			node "node-deny" {
+				policy = "deny"
+			}
+			node "node1" {
+				policy = "read"
+			}
+			service "redis" {
+				policy = "read"
+			}
+		`)
+		var reply structs.IndexedNodesWithGateways
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodesWithGateways{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.ServiceDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.Nodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would match only record without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		var reply structs.IndexedNodesWithGateways
+		req := structs.DCSpecificRequest{
+			Datacenter: "dc1",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexpNotMatchingUserTokenPermissions,
+			},
+		}
+
+		reply = structs.IndexedNodesWithGateways{}
+		if err := msgpackrpc.CallWithCodec(codec, "Internal.ServiceDump", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Empty(t, reply.Nodes)
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestInternal_GatewayServiceDump_Terminating(t *testing.T) {
@@ -1217,10 +1386,11 @@ func TestInternal_GatewayServiceDump_Terminating(t *testing.T) {
 				},
 			},
 			GatewayService: &structs.GatewayService{
-				Gateway:     structs.NewServiceName("terminating-gateway", nil),
-				Service:     structs.NewServiceName("db", nil),
-				GatewayKind: "terminating-gateway",
-				ServiceKind: structs.GatewayServiceKindService,
+				Gateway:         structs.NewServiceName("terminating-gateway", nil),
+				Service:         structs.NewServiceName("db", nil),
+				GatewayKind:     "terminating-gateway",
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		},
 		{
@@ -1251,21 +1421,23 @@ func TestInternal_GatewayServiceDump_Terminating(t *testing.T) {
 				},
 			},
 			GatewayService: &structs.GatewayService{
-				Gateway:     structs.NewServiceName("terminating-gateway", nil),
-				Service:     structs.NewServiceName("db", nil),
-				GatewayKind: "terminating-gateway",
-				ServiceKind: structs.GatewayServiceKindService,
+				Gateway:         structs.NewServiceName("terminating-gateway", nil),
+				Service:         structs.NewServiceName("db", nil),
+				GatewayKind:     "terminating-gateway",
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		},
 		{
 			// Only GatewayService should be returned when linked service isn't registered
 			GatewayService: &structs.GatewayService{
-				Gateway:     structs.NewServiceName("terminating-gateway", nil),
-				Service:     structs.NewServiceName("redis", nil),
-				GatewayKind: "terminating-gateway",
-				CAFile:      "/etc/certs/ca.pem",
-				CertFile:    "/etc/certs/cert.pem",
-				KeyFile:     "/etc/certs/key.pem",
+				Gateway:         structs.NewServiceName("terminating-gateway", nil),
+				Service:         structs.NewServiceName("redis", nil),
+				GatewayKind:     "terminating-gateway",
+				CAFile:          "/etc/certs/ca.pem",
+				CertFile:        "/etc/certs/cert.pem",
+				KeyFile:         "/etc/certs/key.pem",
+				AutoHostRewrite: true,
 			},
 		},
 	}
@@ -1779,10 +1951,11 @@ func TestInternal_ServiceDump_Peering(t *testing.T) {
 	// prep the cluster with some data we can use in our filters
 	registerTestCatalogEntries(t, codec)
 
-	doRequest := func(t *testing.T, filter string) structs.IndexedNodesWithGateways {
+	doRequest := func(t *testing.T, filter string, onlyNodes bool) structs.IndexedNodesWithGateways {
 		t.Helper()
-		args := structs.DCSpecificRequest{
+		args := structs.ServiceDumpRequest{
 			QueryOptions: structs.QueryOptions{Filter: filter},
+			NodesOnly:    onlyNodes,
 		}
 
 		var out structs.IndexedNodesWithGateways
@@ -1792,7 +1965,7 @@ func TestInternal_ServiceDump_Peering(t *testing.T) {
 	}
 
 	t.Run("No peerings", func(t *testing.T) {
-		nodes := doRequest(t, "")
+		nodes := doRequest(t, "", false)
 		// redis (3), web (3), critical (1), warning (1) and consul (1)
 		require.Len(t, nodes.Nodes, 9)
 		require.Len(t, nodes.ImportedNodes, 0)
@@ -1809,19 +1982,27 @@ func TestInternal_ServiceDump_Peering(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("peerings", func(t *testing.T) {
-		nodes := doRequest(t, "")
+		nodes := doRequest(t, "", false)
 		// redis (3), web (3), critical (1), warning (1) and consul (1)
 		require.Len(t, nodes.Nodes, 9)
 		// service (1)
 		require.Len(t, nodes.ImportedNodes, 1)
 	})
 
+	t.Run("peerings onlynodes", func(t *testing.T) {
+		nodes := doRequest(t, "", true)
+		// redis (3), web (3), critical (1), warning (1) and consul (1)
+		require.Len(t, nodes.Nodes, 9)
+		// service (1)
+		require.Len(t, nodes.ImportedNodes, 0)
+	})
+
 	t.Run("peerings w filter", func(t *testing.T) {
-		nodes := doRequest(t, "Node.PeerName == foo")
+		nodes := doRequest(t, "Node.PeerName == foo", false)
 		require.Len(t, nodes.Nodes, 0)
 		require.Len(t, nodes.ImportedNodes, 0)
 
-		nodes2 := doRequest(t, "Node.PeerName == peer1")
+		nodes2 := doRequest(t, "Node.PeerName == peer1", false)
 		require.Len(t, nodes2.Nodes, 0)
 		require.Len(t, nodes2.ImportedNodes, 1)
 	})
@@ -2375,14 +2556,12 @@ func TestInternal_ServiceTopology_ACL(t *testing.T) {
 	}
 
 	t.Parallel()
-	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+	_, s1 := testServerWithConfig(t, func(c *Config) {
 		c.PrimaryDatacenter = "dc1"
 		c.ACLsEnabled = true
 		c.ACLInitialManagementToken = TestDefaultInitialManagementToken
 		c.ACLResolverSettings.ACLDefaultPolicy = "deny"
 	})
-	defer os.RemoveAll(dir1)
-	defer s1.Shutdown()
 
 	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
@@ -2462,6 +2641,40 @@ service "web" { policy = "read" }
 		// Can't read self, fails fast
 		require.True(t, acl.IsErrPermissionDenied(err))
 	})
+}
+
+// Tests that default intention deny policy overrides the ACL allow policy.
+// More comprehensive tests are done at the state store so this is minimal
+// coverage to be confident that the override happens.
+func TestInternal_ServiceTopology_DefaultIntentionPolicy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	_, s1 := testServerWithConfig(t, func(c *Config) {
+		c.PrimaryDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLInitialManagementToken = TestDefaultInitialManagementToken
+		c.ACLResolverSettings.ACLDefaultPolicy = "allow"
+		c.DefaultIntentionPolicy = "deny"
+	})
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	codec := rpcClient(t, s1)
+
+	registerTestTopologyEntries(t, codec, TestDefaultInitialManagementToken)
+
+	args := structs.ServiceSpecificRequest{
+		Datacenter:   "dc1",
+		ServiceName:  "redis",
+		QueryOptions: structs.QueryOptions{Token: TestDefaultInitialManagementToken},
+	}
+	var out structs.IndexedServiceTopology
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Internal.ServiceTopology", &args, &out))
+
+	webSN := structs.NewServiceName("web", acl.DefaultEnterpriseMeta())
+	require.False(t, out.ServiceTopology.DownstreamDecisions[webSN.String()].DefaultAllow)
 }
 
 func TestInternal_IntentionUpstreams(t *testing.T) {
@@ -3620,4 +3833,151 @@ func testUUID() string {
 		buf[6:8],
 		buf[8:10],
 		buf[10:16])
+}
+
+func TestInternal_AssignManualServiceVIPs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+	t.Parallel()
+
+	dir1, s1 := testServer(t)
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	// Set up web service with no manual IPs, and an existing service with manual IPs set.
+	registerReq := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "web",
+			Service: "web",
+			Port:    8888,
+			Connect: structs.ServiceConnect{Native: true},
+		},
+	}
+	var out struct{}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &registerReq, &out))
+
+	registerReq2 := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "existing",
+			Service: "existing",
+			Port:    9999,
+			Connect: structs.ServiceConnect{Native: true},
+		},
+	}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &registerReq2, &out))
+
+	req := structs.AssignServiceManualVIPsRequest{
+		Service:    "existing",
+		ManualVIPs: []string{"8.8.8.8", "9.9.9.9"},
+	}
+	var resp structs.AssignServiceManualVIPsResponse
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Internal.AssignManualServiceVIPs", req, &resp))
+
+	type testcase struct {
+		name        string
+		req         structs.AssignServiceManualVIPsRequest
+		expect      structs.AssignServiceManualVIPsResponse
+		expectAgain structs.AssignServiceManualVIPsResponse
+		expectErr   string
+		expectIPs   []string
+	}
+
+	run := func(t *testing.T, tc testcase, again bool) {
+		if tc.expectErr != "" && again {
+			return // we don't retest known errors
+		}
+
+		var resp structs.AssignServiceManualVIPsResponse
+		idx1 := s1.raft.CommitIndex()
+		err := msgpackrpc.CallWithCodec(codec, "Internal.AssignManualServiceVIPs", tc.req, &resp)
+		idx2 := s1.raft.CommitIndex()
+		if tc.expectErr != "" {
+			testutil.RequireErrorContains(t, err, tc.expectErr)
+		} else {
+			if again {
+				require.Equal(t, tc.expectAgain, resp)
+				require.Equal(t, idx1, idx2, "no raft operations occurred")
+			} else {
+				require.Equal(t, tc.expect, resp)
+			}
+
+			psn := structs.PeeredServiceName{ServiceName: structs.NewServiceName(tc.req.Service, nil)}
+			got, err := s1.fsm.State().ServiceManualVIPs(psn)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, tc.expectIPs, got.ManualIPs)
+		}
+	}
+
+	tcs := []testcase{
+		{
+			name: "successful manual ip assignment",
+			req: structs.AssignServiceManualVIPsRequest{
+				Service:    "web",
+				ManualVIPs: []string{"1.1.1.1", "2.2.2.2"},
+			},
+			expectIPs:   []string{"1.1.1.1", "2.2.2.2"},
+			expect:      structs.AssignServiceManualVIPsResponse{Found: true},
+			expectAgain: structs.AssignServiceManualVIPsResponse{Found: true},
+		},
+		{
+			name: "successfully ignoring duplicates",
+			req: structs.AssignServiceManualVIPsRequest{
+				Service:    "web",
+				ManualVIPs: []string{"1.2.3.4", "5.6.7.8", "1.2.3.4", "5.6.7.8"},
+			},
+			expectIPs:   []string{"1.2.3.4", "5.6.7.8"},
+			expect:      structs.AssignServiceManualVIPsResponse{Found: true},
+			expectAgain: structs.AssignServiceManualVIPsResponse{Found: true},
+		},
+		{
+			name: "reassign existing ip",
+			req: structs.AssignServiceManualVIPsRequest{
+				Service:    "web",
+				ManualVIPs: []string{"8.8.8.8"},
+			},
+			expectIPs: []string{"8.8.8.8"},
+			expect: structs.AssignServiceManualVIPsResponse{
+				Found: true,
+				UnassignedFrom: []structs.PeeredServiceName{
+					{
+						ServiceName: structs.ServiceNameFromString("existing"),
+					},
+				},
+			},
+			// When we repeat this operation the second time it's a no-op.
+			expectAgain: structs.AssignServiceManualVIPsResponse{Found: true},
+		},
+		{
+			name: "invalid ip",
+			req: structs.AssignServiceManualVIPsRequest{
+				Service:    "web",
+				ManualVIPs: []string{"3.3.3.3", "invalid"},
+			},
+			expectErr: "not a valid",
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("initial", func(t *testing.T) {
+				run(t, tc, false)
+			})
+			if tc.expectErr == "" {
+				t.Run("repeat", func(t *testing.T) {
+					run(t, tc, true) // only repeat a write if it isn't an known error
+				})
+			}
+		})
+	}
 }

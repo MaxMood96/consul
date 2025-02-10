@@ -46,7 +46,14 @@
         "ignore_health_on_host_removal": false,
         "connect_timeout": "1s",
         "type": "STATIC",
-        "http2_protocol_options": {},
+        "typed_extension_protocol_options": {
+          "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+            "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+            "explicit_http_config": {
+              "http2_protocol_options": {}
+            }
+          }
+        },
         "loadAssignment": {
           "clusterName": "local_agent",
           "endpoints": [
@@ -197,10 +204,12 @@
   "dynamic_resources": {
     "lds_config": {
       "ads": {},
+      "initial_fetch_timeout": "0s",
       "resource_api_version": "V3"
     },
     "cds_config": {
       "ads": {},
+      "initial_fetch_timeout": "0s",
       "resource_api_version": "V3"
     },
     "ads_config": {

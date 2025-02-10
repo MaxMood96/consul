@@ -5,10 +5,8 @@ name: frontend
 
 on:
   push:
-    branches:
-      - main
+    paths:
       - ui/**
-      - backport/ui/**
 
 permissions:
   contents: read
@@ -23,7 +21,7 @@ jobs:
       compute-large: ${{ steps.setup-outputs.outputs.compute-large }}
       compute-xl: ${{ steps.setup-outputs.outputs.compute-xl }}
     steps:
-    - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # pin@v3.3.0
+    - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
     - id: setup-outputs
       name: Setup outputs
       run: ./.github/scripts/get_runner_classes.sh
@@ -35,14 +33,14 @@ jobs:
       run:
         working-directory: ui
     steps:
-    - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # pin@v3.3.0
+    - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
 
-    - uses: actions/setup-node@64ed1c7eab4cce3362f8c340dee64e5eaeef8f7c # pin@v3.6.0
+    - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
       with:
-        node-version: '16'
+        node-version: '18'
 
     - name: Install Yarn
-      run: npm install -g yarn
+      run: corepack enable
 
     # Install dependencies.
     - name: install yarn packages
@@ -55,14 +53,14 @@ jobs:
     needs: setup
     runs-on: ${{ fromJSON(needs.setup.outputs.compute-small) }}
     steps:
-    - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # pin@v3.3.0
+    - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
 
-    - uses: actions/setup-node@64ed1c7eab4cce3362f8c340dee64e5eaeef8f7c # pin@v3.6.0
+    - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
       with:
-        node-version: '16'
+        node-version: '18'
 
     - name: Install Yarn
-      run: npm install -g yarn
+      run: corepack enable
 
     # Install dependencies.
     - name: install yarn packages
@@ -74,27 +72,68 @@ jobs:
 
   ember-build-test:
     needs: setup
-    runs-on: ${{ fromJSON(needs.setup.outputs.compute-xl) }}
+    if: ${{ !endsWith(github.repository, '-enterprise') }}
+    runs-on: ${{ fromJSON(needs.setup.outputs.compute-large ) }}
     strategy:
       matrix:
         partition: [1, 2, 3, 4]
     env:
-      EMBER_TEST_REPORT: test-results/report-oss.xml # outputs test report for CircleCI test summary
+      EMBER_TEST_REPORT: test-results/report-ce.xml # outputs test report for CI test summary
       EMBER_TEST_PARALLEL: true # enables test parallelization with ember-exam
-      CONSUL_NSPACES_ENABLED: ${{ endsWith(github.repository, '-enterprise') && 1 || 0 }} # NOTE: this should be 1 in ENT.
+      CONSUL_NSPACES_ENABLED: 0 # NOTE: this should be 1 in ENT.
       JOBS: 2 # limit parallelism for broccoli-babel-transpiler
     steps:
-    - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # pin@v3.3.0
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
 
-    - uses: actions/setup-node@64ed1c7eab4cce3362f8c340dee64e5eaeef8f7c # pin@v3.6.0
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: '18'
+
+      - name: Install Yarn
+        run: corepack enable
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@82b9ce628cc5595478a9ebadc480958a36457dc2 # v1.6.0
+
+      - name: Install dependencies
+        working-directory: ui
+        run: make deps
+
+      - name: Build CI
+        working-directory: ui/packages/consul-ui
+        run: make build-ci
+
+      - name: Ember exam
+        working-directory: ui/packages/consul-ui
+        run: node_modules/.bin/ember exam --split=4 --partition=${{ matrix.partition }} --path dist --silent -r xunit
+
+      - name: Test Coverage CI
+        working-directory: ui/packages/consul-ui
+        run: make test-coverage-ci
+
+  ember-build-test-ent:
+    needs: setup
+    runs-on: ${{ fromJSON(needs.setup.outputs.compute-large ) }}
+    strategy:
+      matrix:
+        partition: [1, 2, 3, 4]
+    env:
+      EMBER_TEST_REPORT: test-results/report-ce.xml # outputs test report for CI test summary
+      EMBER_TEST_PARALLEL: true # enables test parallelization with ember-exam
+      CONSUL_NSPACES_ENABLED: 1 # NOTE: this should be 1 in ENT.
+      JOBS: 2 # limit parallelism for broccoli-babel-transpiler
+    steps:
+    - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
+
+    - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
       with:
-        node-version: '16'
+        node-version: '18'
 
     - name: Install Yarn
-      run: npm install -g yarn
+      run: corepack enable
 
     - name: Install Chrome
-      uses: browser-actions/setup-chrome@29abc1a83d1d71557708563b4bc962d0f983a376 # pin@v1.2.1
+      uses: browser-actions/setup-chrome@82b9ce628cc5595478a9ebadc480958a36457dc2 # v1.6.0
 
     - name: Install dependencies
       working-directory: ui
@@ -111,7 +150,6 @@ jobs:
     - name: Test Coverage CI
       working-directory: ui/packages/consul-ui
       run: make test-coverage-ci
-
   # This is job is required for branch protection as a required gihub check
   # because GitHub actions show up as checks at the job level and not the
   # workflow level.  This is currently a feature request:
@@ -133,9 +171,12 @@ jobs:
     - node-tests
     - ember-build-test
     runs-on: ${{ fromJSON(needs.setup.outputs.compute-small) }}
-    if: |
-      (always() && ! cancelled()) &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
+    if: ${{ always() }}
     steps:
-      - run: echo "frontend succeeded"
+      - name: evaluate upstream job results
+        run: |
+          # exit 1 if failure or cancelled result for any upstream job
+          if printf '${{ toJSON(needs) }}' | grep -E -i '\"result\": \"(failure|cancelled)\"'; then
+            printf "Tests failed or workflow cancelled:\n\n${{ toJSON(needs) }}"
+            exit 1
+          fi

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 // package balancer implements a custom gRPC load balancer.
 //
@@ -353,7 +353,7 @@ func (b *balancer) switchServerLocked(newServer *serverInfo) {
 	b.updatePickerLocked()
 
 	if prevConn != nil {
-		b.conn.RemoveSubConn(prevConn)
+		prevConn.Shutdown()
 	}
 }
 

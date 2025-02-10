@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -8,93 +8,15 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
 
+	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
 )
-
-func TestReplication_ConfigSort(t *testing.T) {
-	newDefaults := func(name, protocol string) *structs.ServiceConfigEntry {
-		return &structs.ServiceConfigEntry{
-			Kind:     structs.ServiceDefaults,
-			Name:     name,
-			Protocol: protocol,
-		}
-	}
-	newResolver := func(name string, timeout time.Duration) *structs.ServiceResolverConfigEntry {
-		return &structs.ServiceResolverConfigEntry{
-			Kind:           structs.ServiceResolver,
-			Name:           name,
-			ConnectTimeout: timeout,
-		}
-	}
-
-	type testcase struct {
-		configs []structs.ConfigEntry
-		expect  []structs.ConfigEntry
-	}
-
-	cases := map[string]testcase{
-		"none": {},
-		"one": {
-			configs: []structs.ConfigEntry{
-				newDefaults("web", "grpc"),
-			},
-			expect: []structs.ConfigEntry{
-				newDefaults("web", "grpc"),
-			},
-		},
-		"just kinds": {
-			configs: []structs.ConfigEntry{
-				newResolver("web", 33*time.Second),
-				newDefaults("web", "grpc"),
-			},
-			expect: []structs.ConfigEntry{
-				newDefaults("web", "grpc"),
-				newResolver("web", 33*time.Second),
-			},
-		},
-		"just names": {
-			configs: []structs.ConfigEntry{
-				newDefaults("db", "grpc"),
-				newDefaults("api", "http2"),
-			},
-			expect: []structs.ConfigEntry{
-				newDefaults("api", "http2"),
-				newDefaults("db", "grpc"),
-			},
-		},
-		"all": {
-			configs: []structs.ConfigEntry{
-				newResolver("web", 33*time.Second),
-				newDefaults("web", "grpc"),
-				newDefaults("db", "grpc"),
-				newDefaults("api", "http2"),
-			},
-			expect: []structs.ConfigEntry{
-				newDefaults("api", "http2"),
-				newDefaults("db", "grpc"),
-				newDefaults("web", "grpc"),
-				newResolver("web", 33*time.Second),
-			},
-		},
-	}
-
-	for name, tc := range cases {
-		tc := tc
-		t.Run(name, func(t *testing.T) {
-			configSort(tc.configs)
-			require.Equal(t, tc.expect, tc.configs)
-			// and it should be stable
-			configSort(tc.configs)
-			require.Equal(t, tc.expect, tc.configs)
-		})
-	}
-}
 
 func TestReplication_ConfigEntries(t *testing.T) {
 	if testing.Short() {
@@ -207,7 +129,7 @@ func TestReplication_ConfigEntries(t *testing.T) {
 			Entry: &structs.ServiceConfigEntry{
 				Kind:     structs.ServiceDefaults,
 				Name:     fmt.Sprintf("svc-%d", i),
-				Protocol: "udp",
+				Protocol: "tcp",
 			},
 		}
 
@@ -347,4 +269,64 @@ func TestReplication_ConfigEntries_GraphValidationErrorDuringReplication(t *test
 	retry.Run(t, func(r *retry.R) {
 		checkSame(r)
 	})
+}
+
+func createConfigEntries(num int, indexStart int) []structs.ConfigEntry {
+	entries := make([]structs.ConfigEntry, num)
+	for i := range entries {
+		entries[i] = &structs.ServiceConfigEntry{Name: ulid.Make().String(), RaftIndex: structs.RaftIndex{ModifyIndex: uint64(i + indexStart)}}
+	}
+	return entries
+}
+
+func mutateIDs(e []structs.ConfigEntry, indexStart int) []structs.ConfigEntry {
+	entries := make([]structs.ConfigEntry, len(e))
+	for i := range entries {
+		entries[i] = &structs.ServiceConfigEntry{Name: e[i].GetName(), RaftIndex: structs.RaftIndex{ModifyIndex: uint64(i + indexStart)}}
+	}
+	return entries
+}
+
+func Test_diffConfigEntries(t *testing.T) {
+	type args struct {
+		local           []structs.ConfigEntry
+		remote          []structs.ConfigEntry
+		lastRemoteIndex uint64
+		normalize       bool
+	}
+
+	entries1 := createConfigEntries(10, 10)
+	entries2 := createConfigEntries(10, 20)
+	entries3 := append(entries1, entries2...)
+	entries4 := mutateIDs(entries1, 20)
+	entries5 := mutateIDs(entries1, 0)
+	tests := []struct {
+		name    string
+		args    args
+		updated []structs.ConfigEntry
+		deleted []structs.ConfigEntry
+	}{
+		{"empty", args{local: make([]structs.ConfigEntry, 0), remote: make([]structs.ConfigEntry, 0), lastRemoteIndex: 0, normalize: true}, nil, nil},
+		{"same", args{local: entries1, remote: entries1, lastRemoteIndex: 0, normalize: true}, nil, nil},
+		{"new remote", args{local: nil, remote: entries1, lastRemoteIndex: 0, normalize: true}, entries1, nil},
+		{"extra remote", args{local: entries1, remote: entries3, lastRemoteIndex: 0, normalize: true}, entries2, nil},
+		{"extra local", args{local: entries3, remote: entries1, lastRemoteIndex: 0, normalize: true}, nil, entries2},
+		{"same, same size, different raft ID", args{local: entries1, remote: entries4, lastRemoteIndex: 0, normalize: true}, nil, nil},
+		{"when hash is empty, avoid hash compare", args{local: entries5, remote: entries4, lastRemoteIndex: 0, normalize: false}, entries4, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.args.normalize {
+				for _, l := range tt.args.local {
+					require.NoError(t, l.Normalize())
+				}
+				for _, r := range tt.args.remote {
+					require.NoError(t, r.Normalize())
+				}
+			}
+			deletions, updates := diffConfigEntries(tt.args.local, tt.args.remote, tt.args.lastRemoteIndex)
+			assert.Equalf(t, tt.updated, updates, "updated diffConfigEntries(%v, %v, %v)", tt.args.local, tt.args.remote, tt.args.lastRemoteIndex)
+			assert.Equalf(t, tt.deleted, deletions, "deleted diffConfigEntries(%v, %v, %v)", tt.args.local, tt.args.remote, tt.args.lastRemoteIndex)
+		})
+	}
 }

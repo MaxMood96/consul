@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package fsm
 
@@ -195,6 +195,10 @@ func (c *FSM) Apply(log *raft.Log) interface{} {
 		c.logger.Warn("ignoring unknown message type, upgrade to newer version", "type", msgType)
 		return nil
 	}
+	if structs.CEDowngrade && msgType >= 64 {
+		c.logger.Warn("ignoring enterprise message as part of downgrade to CE", "type", msgType)
+		return nil
+	}
 	panic(fmt.Errorf("failed to apply request: %#v", buf))
 }
 
@@ -263,8 +267,12 @@ func (c *FSM) Restore(old io.ReadCloser) error {
 				return err
 			}
 		default:
-			if msg >= 64 {
-				return fmt.Errorf("msg type <%d> is a Consul Enterprise log entry. Consul OSS cannot restore it", msg)
+			if structs.CEDowngrade && msg >= 64 {
+				c.logger.Warn("ignoring enterprise message as part of downgrade to CE", "type", msg)
+				var ignore interface{}
+				return dec.Decode(&ignore)
+			} else if msg >= 64 {
+				return fmt.Errorf("msg type <%d> is a Consul Enterprise log entry. Consul CE cannot restore it", msg)
 			} else {
 				return fmt.Errorf("Unrecognized msg type %d", msg)
 			}
@@ -296,9 +304,7 @@ func (c *FSM) Restore(old io.ReadCloser) error {
 	// for new data. To prevent that inconsistency we refresh the topics while holding
 	// the lock which ensures that any subscriptions to topics for FSM generated events
 	if c.deps.Publisher != nil {
-		c.deps.Publisher.RefreshTopic(state.EventTopicServiceHealth)
-		c.deps.Publisher.RefreshTopic(state.EventTopicServiceHealthConnect)
-		c.deps.Publisher.RefreshTopic(state.EventTopicCARoots)
+		c.deps.Publisher.RefreshAllTopics()
 	}
 	c.stateLock.Unlock()
 
@@ -397,6 +403,11 @@ func (c *FSM) registerStreamSnapshotHandlers() {
 	}, true)
 	panicIfErr(err)
 
+	err = c.deps.Publisher.RegisterHandler(state.EventTopicFileSystemCertificate, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
+		return c.State().FileSystemCertificateSnapshot(req, buf)
+	}, true)
+	panicIfErr(err)
+
 	err = c.deps.Publisher.RegisterHandler(state.EventTopicInlineCertificate, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
 		return c.State().InlineCertificateSnapshot(req, buf)
 	}, true)
@@ -419,6 +430,21 @@ func (c *FSM) registerStreamSnapshotHandlers() {
 
 	err = c.deps.Publisher.RegisterHandler(state.EventTopicIPRateLimit, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
 		return c.State().IPRateLimiterSnapshot(req, buf)
+	}, true)
+	panicIfErr(err)
+
+	err = c.deps.Publisher.RegisterHandler(state.EventTopicSamenessGroup, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
+		return c.State().SamenessGroupSnapshot(req, buf)
+	}, true)
+	panicIfErr(err)
+
+	err = c.deps.Publisher.RegisterHandler(state.EventTopicJWTProvider, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
+		return c.State().JWTProviderSnapshot(req, buf)
+	}, true)
+	panicIfErr(err)
+
+	err = c.deps.Publisher.RegisterHandler(state.EventTopicExportedServices, func(req stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
+		return c.State().ExportedServicesSnapshot(req, buf)
 	}, true)
 	panicIfErr(err)
 }

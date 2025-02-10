@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package oidcauth
 
@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/go-oidc"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/hashicorp/consul/internal/go-sso/oidcauth/oidcauthtest"
 	"github.com/stretchr/testify/require"
 )

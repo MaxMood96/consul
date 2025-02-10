@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package gateways
 
@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/testcontainers/testcontainers-go"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/consul/api"
+
 	libassert "github.com/hashicorp/consul/test/integration/consul-container/libs/assert"
 	libcluster "github.com/hashicorp/consul/test/integration/consul-container/libs/cluster"
 	libservice "github.com/hashicorp/consul/test/integration/consul-container/libs/service"
@@ -69,7 +71,7 @@ func TestHTTPRouteFlattening(t *testing.T) {
 			InjectGossipEncryption: true,
 			AllowHTTPAnyway:        true,
 		},
-		Ports: []int{
+		ExposedPorts: []int{
 			listenerPort,
 			serviceOneHTTPPort,
 			serviceOneGRPCPort,
@@ -82,26 +84,9 @@ func TestHTTPRouteFlattening(t *testing.T) {
 	cluster, _, _ := libtopology.NewCluster(t, clusterConfig)
 	client := cluster.Agents[0].GetClient()
 
-	gwNamespace := getNamespace()
-	if gwNamespace != "" {
-		ns := &api.Namespace{Name: gwNamespace}
-		_, _, err := client.Namespaces().Create(ns, nil)
-		require.NoError(t, err)
-	}
-
-	serviceOneNamespace := getNamespace()
-	if serviceOneNamespace != "" {
-		ns := &api.Namespace{Name: serviceOneNamespace}
-		_, _, err := client.Namespaces().Create(ns, nil)
-		require.NoError(t, err)
-	}
-
-	serviceTwoNamespace := getNamespace()
-	if serviceTwoNamespace != "" {
-		ns := &api.Namespace{Name: serviceTwoNamespace}
-		_, _, err := client.Namespaces().Create(ns, nil)
-		require.NoError(t, err)
-	}
+	gwNamespace := getOrCreateNamespace(t, client)
+	serviceOneNamespace := getOrCreateNamespace(t, client)
+	serviceTwoNamespace := getOrCreateNamespace(t, client)
 
 	_, _, err := libservice.CreateAndRegisterStaticServerAndSidecar(cluster.Agents[0], &libservice.ServiceOpts{
 		Name:      serviceOneName,
@@ -244,9 +229,9 @@ func TestHTTPRouteFlattening(t *testing.T) {
 	libassert.CatalogServiceExists(t, client, gatewayName, &api.QueryOptions{Namespace: gwNamespace})
 
 	// make sure config entries have been properly created
-	checkGatewayConfigEntry(t, client, gatewayName, gwNamespace)
-	checkHTTPRouteConfigEntry(t, client, routeOneName, gwNamespace)
-	checkHTTPRouteConfigEntry(t, client, routeTwoName, gwNamespace)
+	checkGatewayConfigEntry(t, client, gatewayName, &api.QueryOptions{Namespace: gwNamespace})
+	checkHTTPRouteConfigEntry(t, client, routeOneName, &api.QueryOptions{Namespace: gwNamespace})
+	checkHTTPRouteConfigEntry(t, client, routeTwoName, &api.QueryOptions{Namespace: gwNamespace})
 
 	// gateway resolves routes
 	gatewayPort, err := gatewayService.GetPort(listenerPort)
@@ -284,7 +269,7 @@ func TestHTTPRouteFlattening(t *testing.T) {
 	}, checkOptions{debug: false, statusCode: serviceOneResponseCode, testName: "service1, v2 path with v2 hostname"})
 }
 
-func TestHTTPRoutePathRewrite(t *testing.T) {
+func TestHTTPRouteFilters(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
@@ -314,7 +299,7 @@ func TestHTTPRoutePathRewrite(t *testing.T) {
 			InjectGossipEncryption: true,
 			AllowHTTPAnyway:        true,
 		},
-		Ports: []int{
+		ExposedPorts: []int{
 			listenerPort,
 			fooHTTPPort,
 			fooGRPCPort,
@@ -332,12 +317,7 @@ func TestHTTPRoutePathRewrite(t *testing.T) {
 	fooPath := "/v1/foo"
 	barPath := "/v1/bar"
 
-	namespace := getNamespace()
-	if namespace != "" {
-		ns := &api.Namespace{Name: namespace}
-		_, _, err := client.Namespaces().Create(ns, nil)
-		require.NoError(t, err)
-	}
+	namespace := getOrCreateNamespace(t, client)
 
 	_, _, err := libservice.CreateAndRegisterStaticServerAndSidecar(cluster.Agents[0], &libservice.ServiceOpts{
 		ID:        fooName,
@@ -414,6 +394,12 @@ func TestHTTPRoutePathRewrite(t *testing.T) {
 						Path: fooPath,
 					},
 				},
+				ResponseFilters: api.HTTPResponseFilters{
+					Headers: []api.HTTPHeaderFilter{{
+						Add: map[string]string{"response-filters-add": "present"},
+						Set: map[string]string{"response-filters-set": "present"},
+					}},
+				},
 				Services: []api.HTTPService{
 					{
 						Name:      fooName,
@@ -486,9 +472,9 @@ func TestHTTPRoutePathRewrite(t *testing.T) {
 	libassert.CatalogServiceExists(t, client, gatewayName, &api.QueryOptions{Namespace: namespace})
 
 	// make sure config entries have been properly created
-	checkGatewayConfigEntry(t, client, gatewayName, namespace)
-	checkHTTPRouteConfigEntry(t, client, invalidRouteName, namespace)
-	checkHTTPRouteConfigEntry(t, client, validRouteName, namespace)
+	checkGatewayConfigEntry(t, client, gatewayName, &api.QueryOptions{Namespace: namespace})
+	checkHTTPRouteConfigEntry(t, client, invalidRouteName, &api.QueryOptions{Namespace: namespace})
+	checkHTTPRouteConfigEntry(t, client, validRouteName, &api.QueryOptions{Namespace: namespace})
 
 	gatewayPort, err := gatewayService.GetPort(listenerPort)
 	require.NoError(t, err)
@@ -499,13 +485,23 @@ func TestHTTPRoutePathRewrite(t *testing.T) {
 	debugExpectedStatusCode := 200
 
 	// hit foo, making sure path is being rewritten by hitting the debug page
-	checkRoute(t, gatewayPort, fooUnrewritten, map[string]string{
-		"Host": "test.foo",
-	}, checkOptions{debug: true, statusCode: debugExpectedStatusCode, testName: "foo service"})
+	// and that we get the expected response headers that we added modifiers for
+	checkRoute(
+		t, gatewayPort, fooUnrewritten, map[string]string{"Host": "test.foo"},
+		checkOptions{
+			debug:           true,
+			responseHeaders: map[string]string{"response-filters-add": "present", "response-filters-set": "present"},
+			statusCode:      debugExpectedStatusCode,
+			testName:        "foo service"})
 	// make sure foo is being sent to proper service
-	checkRoute(t, gatewayPort, fooUnrewritten+"/foo", map[string]string{
-		"Host": "test.foo",
-	}, checkOptions{debug: false, statusCode: fooStatusCode, testName: "foo service 2"})
+	// and that we get the expected response headers that we added modifiers for
+	checkRoute(
+		t, gatewayPort, fooUnrewritten+"/foo", map[string]string{"Host": "test.foo"},
+		checkOptions{
+			debug:           false,
+			responseHeaders: map[string]string{"response-filters-add": "present", "response-filters-set": "present"},
+			statusCode:      fooStatusCode,
+			testName:        "foo service 2"})
 
 	// hit bar, making sure its been rewritten
 	checkRoute(t, gatewayPort, barUnrewritten, map[string]string{
@@ -522,8 +518,6 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
-
-	t.Parallel()
 
 	// infrastructure set up
 	address := "localhost"
@@ -548,7 +542,7 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 			InjectGossipEncryption: true,
 			AllowHTTPAnyway:        true,
 		},
-		Ports: []int{
+		ExposedPorts: []int{
 			listenerOnePort,
 			listenerTwoPort,
 			serviceHTTPPort,
@@ -560,13 +554,7 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 	cluster, _, _ := libtopology.NewCluster(t, clusterConfig)
 	client := cluster.APIClient(0)
 
-	// getNamespace() should always return an empty string in Consul OSS
-	namespace := getNamespace()
-	if namespace != "" {
-		ns := &api.Namespace{Name: namespace}
-		_, _, err := client.Namespaces().Create(ns, nil)
-		require.NoError(t, err)
-	}
+	namespace := getOrCreateNamespace(t, client)
 
 	_, _, err := libservice.CreateAndRegisterStaticServerAndSidecar(cluster.Agents[0], &libservice.ServiceOpts{
 		ID:        serviceName,
@@ -603,7 +591,7 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 		Namespace: namespace,
 	}
 	require.NoError(t, cluster.ConfigEntryWrite(gatewayOne))
-	checkGatewayConfigEntry(t, client, gatewayOneName, namespace)
+	checkGatewayConfigEntry(t, client, gatewayOneName, &api.QueryOptions{Namespace: namespace})
 
 	// create gateway service
 	gwOneCfg := libservice.GatewayConfig{
@@ -630,7 +618,7 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 		Namespace: namespace,
 	}
 	require.NoError(t, cluster.ConfigEntryWrite(gatewayTwo))
-	checkGatewayConfigEntry(t, client, gatewayTwoName, namespace)
+	checkGatewayConfigEntry(t, client, gatewayTwoName, &api.QueryOptions{Namespace: namespace})
 
 	// create gateway service
 	gwTwoCfg := libservice.GatewayConfig{
@@ -749,4 +737,234 @@ func TestHTTPRouteParentRefChange(t *testing.T) {
 	checkRouteError(t, address, gatewayOnePort, "", map[string]string{
 		"Host": "test.foo",
 	}, "")
+}
+
+func TestHTTPRouteRetryAndTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	// infrastructure set up
+	listenerPort := 6018
+	retryServiceHTTPPort := 6019
+	retryServiceGRPCPort := 6020
+	timeoutServiceHTTPPort := 6021
+	timeoutServiceGRPCPort := 6022
+
+	retryServiceName := randomName("service", 16)
+	gatewayName := randomName("gw", 16)
+	retryRouteName := randomName("route", 16)
+	timeoutServiceName := randomName("service", 16)
+	timeoutRouteName := randomName("route", 16)
+	retryPath := "/retry"
+	timeoutPath := "/timeout"
+
+	clusterConfig := &libtopology.ClusterConfig{
+		NumServers: 1,
+		NumClients: 1,
+		BuildOpts: &libcluster.BuildOptions{
+			Datacenter:             "dc1",
+			InjectAutoEncryption:   true,
+			InjectGossipEncryption: true,
+			AllowHTTPAnyway:        true,
+		},
+		ExposedPorts: []int{
+			listenerPort,
+			retryServiceGRPCPort,
+			retryServiceHTTPPort,
+			timeoutServiceGRPCPort,
+			timeoutServiceHTTPPort,
+		},
+		ApplyDefaultProxySettings: true,
+	}
+
+	cluster, _, _ := libtopology.NewCluster(t, clusterConfig)
+	client := cluster.Agents[0].GetClient()
+
+	namespace := getOrCreateNamespace(t, client)
+
+	_, _, err := libservice.CreateAndRegisterCustomServiceAndSidecar(
+		cluster.Agents[0], &libservice.ServiceOpts{
+			ID:        retryServiceName,
+			Name:      retryServiceName,
+			Namespace: namespace,
+			HTTPPort:  retryServiceHTTPPort,
+			GRPCPort:  retryServiceGRPCPort,
+		},
+		testcontainers.ContainerRequest{
+			Image: libservice.HashicorpDockerProxy + "/nicholasjackson/fake-service:v0.26.0",
+			Env: map[string]string{
+				"LISTEN_ADDR": fmt.Sprintf("0.0.0.0:%d", retryServiceHTTPPort),
+				"ERROR_RATE":  "0.5",
+			},
+		},
+		nil,
+	)
+	require.NoError(t, err)
+
+	_, _, err = libservice.CreateAndRegisterCustomServiceAndSidecar(
+		cluster.Agents[0], &libservice.ServiceOpts{
+			ID:        timeoutServiceName,
+			Name:      timeoutServiceName,
+			Namespace: namespace,
+			HTTPPort:  timeoutServiceHTTPPort,
+			GRPCPort:  timeoutServiceGRPCPort,
+		},
+		testcontainers.ContainerRequest{
+			Image: libservice.HashicorpDockerProxy + "/nicholasjackson/fake-service:v0.26.0",
+			Env: map[string]string{
+				"LISTEN_ADDR": fmt.Sprintf("0.0.0.0:%d", timeoutServiceHTTPPort),
+				"ERROR_RATE":  "1.0",
+				"ERROR_DELAY": "1m",
+			},
+		},
+		nil,
+	)
+
+	require.NoError(t, err)
+
+	// write config entries
+	proxyDefaults := &api.ProxyConfigEntry{
+		Kind: api.ProxyDefaults,
+		Name: api.ProxyConfigGlobal,
+		Config: map[string]interface{}{
+			"protocol": "http",
+		},
+	}
+
+	require.NoError(t, cluster.ConfigEntryWrite(proxyDefaults))
+
+	apiGateway := &api.APIGatewayConfigEntry{
+		Kind: "api-gateway",
+		Name: gatewayName,
+		Listeners: []api.APIGatewayListener{
+			{
+				Name:     "listener",
+				Port:     listenerPort,
+				Protocol: "http",
+			},
+		},
+		Namespace: namespace,
+	}
+
+	retryRoute := &api.HTTPRouteConfigEntry{
+		Kind:      api.HTTPRoute,
+		Name:      retryRouteName,
+		Namespace: namespace,
+		Parents: []api.ResourceReference{
+			{
+				Kind:      api.APIGateway,
+				Name:      gatewayName,
+				Namespace: namespace,
+			},
+		},
+		Hostnames: []string{
+			"test.foo",
+			"test.example",
+		},
+		Rules: []api.HTTPRouteRule{
+			{
+				Filters: api.HTTPFilters{
+					RetryFilter: &api.RetryFilter{
+						NumRetries:         10,
+						RetryOnStatusCodes: []uint32{500},
+					},
+				},
+				Services: []api.HTTPService{
+					{
+						Name:      retryServiceName,
+						Namespace: namespace,
+					},
+				},
+				Matches: []api.HTTPMatch{
+					{
+						Path: api.HTTPPathMatch{
+							Match: api.HTTPPathMatchPrefix,
+							Value: retryPath,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	timeoutRoute := &api.HTTPRouteConfigEntry{
+		Kind:      api.HTTPRoute,
+		Name:      timeoutRouteName,
+		Namespace: namespace,
+		Parents: []api.ResourceReference{
+			{
+				Kind:      api.APIGateway,
+				Name:      gatewayName,
+				Namespace: namespace,
+			},
+		},
+		Hostnames: []string{
+			"test.foo",
+			"test.example",
+		},
+		Rules: []api.HTTPRouteRule{
+			{
+				Filters: api.HTTPFilters{
+					TimeoutFilter: &api.TimeoutFilter{
+						RequestTimeout: 1,
+						IdleTimeout:    1,
+					},
+				},
+				Services: []api.HTTPService{
+					{
+						Name:      timeoutServiceName,
+						Namespace: namespace,
+					},
+				},
+				Matches: []api.HTTPMatch{
+					{
+						Path: api.HTTPPathMatch{
+							Match: api.HTTPPathMatchPrefix,
+							Value: timeoutPath,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, cluster.ConfigEntryWrite(apiGateway))
+	require.NoError(t, cluster.ConfigEntryWrite(timeoutRoute))
+	require.NoError(t, cluster.ConfigEntryWrite(retryRoute))
+
+	// create gateway service
+	gwCfg := libservice.GatewayConfig{
+		Name:      gatewayName,
+		Kind:      "api",
+		Namespace: namespace,
+	}
+	gatewayService, err := libservice.NewGatewayService(context.Background(), gwCfg, cluster.Agents[0], listenerPort)
+	require.NoError(t, err)
+	libassert.CatalogServiceExists(t, client, gatewayName, &api.QueryOptions{Namespace: namespace})
+
+	// make sure config entries have been properly created
+	checkGatewayConfigEntry(t, client, gatewayName, &api.QueryOptions{Namespace: namespace})
+	t.Log("checking retry route")
+	checkHTTPRouteConfigEntry(t, client, retryRouteName, &api.QueryOptions{Namespace: namespace})
+
+	t.Log("checking timeout route")
+	checkHTTPRouteConfigEntry(t, client, timeoutRouteName, &api.QueryOptions{Namespace: namespace})
+
+	// gateway resolves routes
+	gatewayPort, err := gatewayService.GetPort(listenerPort)
+	require.NoError(t, err)
+	fmt.Println("Gateway Port: ", gatewayPort)
+
+	// hit service 1 by hitting root path
+	checkRoute(t, gatewayPort, retryPath, map[string]string{
+		"Host": "test.foo",
+	}, checkOptions{debug: false, statusCode: 200, testName: "retry should succeed cleanly", expectedBody: "Hello World"})
+
+	checkRoute(t, gatewayPort, timeoutPath, map[string]string{
+		"Host": "test.foo",
+	}, checkOptions{debug: false, statusCode: 500, testName: "timeout should timeout", expectedBody: "timeout"})
+
 }

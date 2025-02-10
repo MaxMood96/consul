@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package discoverychain
 
@@ -27,9 +27,10 @@ type GatewayChainSynthesizer struct {
 }
 
 type hostnameMatch struct {
-	match    structs.HTTPMatch
-	filters  structs.HTTPFilters
-	services []structs.HTTPService
+	match           structs.HTTPMatch
+	filters         structs.HTTPFilters
+	responseFilters structs.HTTPResponseFilters
+	services        []structs.HTTPService
 }
 
 // NewGatewayChainSynthesizer creates a new GatewayChainSynthesizer for the
@@ -59,9 +60,13 @@ func (l *GatewayChainSynthesizer) SetHostname(hostname string) {
 // single hostname can be specified in multiple routes. Routing for a given
 // hostname must behave based on the aggregate of all rules that apply to it.
 func (l *GatewayChainSynthesizer) AddHTTPRoute(route structs.HTTPRouteConfigEntry) {
-	hostnames := route.FilteredHostnames(l.hostname)
+	l.matchesByHostname = initHostMatches(l.hostname, &route, l.matchesByHostname)
+}
+
+func initHostMatches(hostname string, route *structs.HTTPRouteConfigEntry, currentMatches map[string][]hostnameMatch) map[string][]hostnameMatch {
+	hostnames := route.FilteredHostnames(hostname)
 	for _, host := range hostnames {
-		matches, ok := l.matchesByHostname[host]
+		matches, ok := currentMatches[host]
 		if !ok {
 			matches = []hostnameMatch{}
 		}
@@ -83,15 +88,17 @@ func (l *GatewayChainSynthesizer) AddHTTPRoute(route structs.HTTPRouteConfigEntr
 			// Add all matches for this rule to the list for this hostname
 			for _, match := range rule.Matches {
 				matches = append(matches, hostnameMatch{
-					match:    match,
-					filters:  rule.Filters,
-					services: rule.Services,
+					match:           match,
+					filters:         rule.Filters,
+					responseFilters: rule.ResponseFilters,
+					services:        rule.Services,
 				})
 			}
 		}
 
-		l.matchesByHostname[host] = matches
+		currentMatches[host] = matches
 	}
+	return currentMatches
 }
 
 // Synthesize assembles a synthetic discovery chain from multiple other discovery chains
@@ -116,6 +123,7 @@ func (l *GatewayChainSynthesizer) Synthesize(chains ...*structs.CompiledDiscover
 
 	compiledChains := make([]*structs.CompiledDiscoveryChain, 0, len(set))
 	for i, service := range services {
+
 		entries := set[i]
 
 		compiled, err := Compile(CompileRequest{
@@ -126,7 +134,6 @@ func (l *GatewayChainSynthesizer) Synthesize(chains ...*structs.CompiledDiscover
 			EvaluateInTrustDomain: l.trustDomain,
 			Entries:               entries,
 		})
-
 		if err != nil {
 			return nil, nil, err
 		}
@@ -188,17 +195,34 @@ func (l *GatewayChainSynthesizer) Synthesize(chains ...*structs.CompiledDiscover
 // consolidateHTTPRoutes combines all rules into the shortest possible list of routes
 // with one route per hostname containing all rules for that hostname.
 func (l *GatewayChainSynthesizer) consolidateHTTPRoutes() []structs.HTTPRouteConfigEntry {
+	return consolidateHTTPRoutes(l.matchesByHostname, l.suffix, l.gateway)
+}
+
+// ConsolidateHTTPRoutes takes in one or more HTTPRoutes and consolidates them down to the minimum
+// set of HTTPRoutes that can represent the same set of rules. This should result in approx. one
+// HTTPRoute per hostname.
+func ConsolidateHTTPRoutes(gateway *structs.APIGatewayConfigEntry, listener *structs.APIGatewayListener, routes ...*structs.HTTPRouteConfigEntry) []structs.HTTPRouteConfigEntry {
+	matches := map[string][]hostnameMatch{}
+	for _, route := range routes {
+		matches = initHostMatches(listener.GetHostname(), route, matches)
+	}
+	return consolidateHTTPRoutes(matches, listener.Name, gateway)
+}
+
+// consolidateHTTPRoutes combines all rules into the shortest possible list of routes
+// with one route per hostname containing all rules for that hostname.
+func consolidateHTTPRoutes(matchesByHostname map[string][]hostnameMatch, listenerName string, gateway *structs.APIGatewayConfigEntry) []structs.HTTPRouteConfigEntry {
 	var routes []structs.HTTPRouteConfigEntry
 
-	for hostname, rules := range l.matchesByHostname {
+	for hostname, rules := range matchesByHostname {
 		// Create route for this hostname
 		route := structs.HTTPRouteConfigEntry{
 			Kind:           structs.HTTPRoute,
-			Name:           fmt.Sprintf("%s-%s-%s", l.gateway.Name, l.suffix, hostsKey(hostname)),
+			Name:           fmt.Sprintf("%s-%s-%s", gateway.Name, listenerName, hostsKey(hostname)),
 			Hostnames:      []string{hostname},
 			Rules:          make([]structs.HTTPRouteRule, 0, len(rules)),
-			Meta:           l.gateway.Meta,
-			EnterpriseMeta: l.gateway.EnterpriseMeta,
+			Meta:           gateway.Meta,
+			EnterpriseMeta: gateway.EnterpriseMeta,
 		}
 
 		// Sort rules for this hostname in order of precedence
@@ -209,9 +233,10 @@ func (l *GatewayChainSynthesizer) consolidateHTTPRoutes() []structs.HTTPRouteCon
 		// Add all rules for this hostname
 		for _, rule := range rules {
 			route.Rules = append(route.Rules, structs.HTTPRouteRule{
-				Matches:  []structs.HTTPMatch{rule.match},
-				Filters:  rule.filters,
-				Services: rule.services,
+				Matches:         []structs.HTTPMatch{rule.match},
+				Filters:         rule.filters,
+				ResponseFilters: rule.responseFilters,
+				Services:        rule.services,
 			})
 		}
 
@@ -232,6 +257,13 @@ func targetForResolverNode(nodeName string, chains []*structs.CompiledDiscoveryC
 	splitterName := splitterPrefix + strings.TrimPrefix(nodeName, resolverPrefix)
 
 	for _, c := range chains {
+		targetChainPrefix := resolverPrefix + c.ID()
+		if strings.HasPrefix(nodeName, targetChainPrefix) && len(c.Nodes) == 1 {
+			// we have a virtual resolver that just maps to another resolver, return
+			// the given node name
+			return c.StartNode
+		}
+
 		for name, node := range c.Nodes {
 			if node.IsSplitter() && strings.HasPrefix(splitterName, name) {
 				return name
@@ -258,12 +290,14 @@ func (l *GatewayChainSynthesizer) synthesizeEntries() ([]structs.IngressService,
 	entries := []*configentry.DiscoveryChainSet{}
 
 	for _, route := range l.consolidateHTTPRoutes() {
-		entrySet := configentry.NewDiscoveryChainSet()
 		ingress, router, splitters, defaults := synthesizeHTTPRouteDiscoveryChain(route)
+
+		services = append(services, ingress)
+
+		entrySet := configentry.NewDiscoveryChainSet()
 		entrySet.AddRouters(router)
 		entrySet.AddSplitters(splitters...)
 		entrySet.AddServices(defaults...)
-		services = append(services, ingress)
 		entries = append(entries, entrySet)
 	}
 
