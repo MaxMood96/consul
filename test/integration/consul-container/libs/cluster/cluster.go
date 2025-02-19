@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package cluster
 
@@ -15,14 +15,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/sdk/testutil/retry"
-	"github.com/hashicorp/serf/serf"
-
 	goretry "github.com/avast/retry-go"
+	"github.com/hashicorp/serf/serf"
 	"github.com/stretchr/testify/require"
 	"github.com/teris-io/shortid"
 	"github.com/testcontainers/testcontainers-go"
+
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
+	"github.com/hashicorp/consul/test/integration/consul-container/libs/utils"
 )
 
 // Cluster provides an interface for creating and controlling a Consul cluster
@@ -92,11 +93,12 @@ func New(t TestingT, configs []Config, ports ...int) (*Cluster, error) {
 	}
 
 	cluster := &Cluster{
-		ID:          id,
-		Network:     network,
-		NetworkName: name,
-		ScratchDir:  scratchDir,
-		ACLEnabled:  configs[0].ACLEnabled,
+		ID:             id,
+		Network:        network,
+		NetworkName:    name,
+		ScratchDir:     scratchDir,
+		ACLEnabled:     configs[0].ACLEnabled,
+		TokenBootstrap: configs[0].TokenBootstrap,
 	}
 	t.Cleanup(func() {
 		_ = cluster.Terminate()
@@ -170,6 +172,10 @@ func (c *Cluster) Add(configs []Config, serfJoin bool, ports ...int) (xe error) 
 		}
 	}
 
+	if utils.Debug {
+		c.PrintDebugInfo(agents)
+	}
+
 	return nil
 }
 
@@ -188,8 +194,8 @@ func (c *Cluster) join(agents []Agent, skipSerfJoin bool) error {
 	}
 
 	if len(c.Agents) == 0 {
-		// if acl enabled, generate the bootstrap tokens at the first agent
-		if c.ACLEnabled {
+		// if acl enabled and bootstrap token is null, generate the bootstrap tokens at the first agent
+		if c.ACLEnabled && c.TokenBootstrap == "" {
 			var (
 				output string
 				err    error
@@ -299,7 +305,7 @@ func (c *Cluster) Remove(n Agent) error {
 // helpers below.
 //
 // This lets us have tests that assert that an upgrade will fail.
-func (c *Cluster) StandardUpgrade(t *testing.T, ctx context.Context, targetVersion string) error {
+func (c *Cluster) StandardUpgrade(t *testing.T, ctx context.Context, targetImage string, targetVersion string) error {
 	var err error
 	// We take a snapshot, but note that we currently do nothing with it.
 	if c.ACLEnabled {
@@ -343,6 +349,7 @@ func (c *Cluster) StandardUpgrade(t *testing.T, ctx context.Context, targetVersi
 
 	upgradeFn := func(agent Agent, clientFactory func() (*api.Client, error)) error {
 		config := agent.GetConfig()
+		config.Image = targetImage
 		config.Version = targetVersion
 
 		if agent.IsServer() {
@@ -592,6 +599,7 @@ func (c *Cluster) PeerWithCluster(acceptingClient *api.Client, acceptingPeerName
 }
 
 const retryTimeout = 90 * time.Second
+
 const retryFrequency = 500 * time.Millisecond
 
 func LongFailer() *retry.Timer {
@@ -659,6 +667,26 @@ func (c *Cluster) ConfigEntryDelete(entry api.ConfigEntry) error {
 		return fmt.Errorf("error deleting config entry: %v", err)
 	}
 	return err
+}
+
+func (c *Cluster) PrintDebugInfo(agents []Agent) {
+	for _, a := range agents {
+		uri := a.GetInfo().DebugURI
+		n := a.GetAgentName()
+		s := a.IsServer()
+		l := "NA"
+		if s {
+			leader, err := c.Leader()
+			if err == nil {
+				if leader == a {
+					l = "true"
+				} else {
+					l = "false"
+				}
+			}
+		}
+		fmt.Printf("\ndebug info:: n=%s,s=%t,l=%s,uri=%s\n\n", n, s, l, uri)
+	}
 }
 
 func extractSecretIDFrom(tokenOutput string) (string, error) {

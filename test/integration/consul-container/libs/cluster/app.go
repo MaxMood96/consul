@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package cluster
 
@@ -62,8 +62,9 @@ func LaunchContainerOnNode(
 		ContainerRequest: req,
 		Started:          true,
 	})
+	fmt.Printf("creating container with image: %s(%s)\n", req.Name, req.Image)
 	if err != nil {
-		return nil, fmt.Errorf("creating container: %w", err)
+		return nil, fmt.Errorf("creating container: %s(%s), %w", req.Name, req.Image, err)
 	}
 	deferClean.Add(func() {
 		_ = container.Terminate(ctx)

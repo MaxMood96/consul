@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfgglue
 
@@ -8,6 +8,7 @@ import (
 
 	"github.com/hashicorp/go-memdb"
 
+	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/configentry"
@@ -41,12 +42,13 @@ func (s *serverResolvedServiceConfig) Notify(ctx context.Context, req *structs.S
 
 	return watch.ServerLocalNotify(ctx, correlationID, s.deps.GetStore,
 		func(ws memdb.WatchSet, store Store) (uint64, *structs.ServiceConfigResponse, error) {
-			authz, err := s.deps.ACLResolver.ResolveTokenAndDefaultMeta(req.Token, &req.EnterpriseMeta, nil)
+			var authzContext acl.AuthorizerContext
+			authz, err := s.deps.ACLResolver.ResolveTokenAndDefaultMeta(req.Token, &req.EnterpriseMeta, &authzContext)
 			if err != nil {
 				return 0, nil, err
 			}
 
-			if err := authz.ToAllowAuthorizer().ServiceReadAllowed(req.Name, nil); err != nil {
+			if err := authz.ToAllowAuthorizer().ServiceReadAllowed(req.Name, &authzContext); err != nil {
 				return 0, nil, err
 			}
 

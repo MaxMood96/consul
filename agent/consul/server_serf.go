@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
@@ -20,9 +21,10 @@ import (
 	"github.com/hashicorp/consul/agent/consul/wanfed"
 	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/internal/gossip/libserf"
 	"github.com/hashicorp/consul/lib"
-	libserf "github.com/hashicorp/consul/lib/serf"
 	"github.com/hashicorp/consul/logging"
+	"github.com/hashicorp/consul/types"
 )
 
 const (
@@ -359,6 +361,7 @@ func (s *Server) lanNodeJoin(me serf.MemberEvent) {
 
 		// Update server lookup
 		s.serverLookup.AddServer(serverMeta)
+		s.router.AddServer(types.AreaLAN, serverMeta)
 
 		// If we're still expecting to bootstrap, may need to handle this.
 		if s.config.BootstrapExpect != 0 {
@@ -380,6 +383,7 @@ func (s *Server) lanNodeUpdate(me serf.MemberEvent) {
 
 		// Update server lookup
 		s.serverLookup.AddServer(serverMeta)
+		s.router.AddServer(types.AreaLAN, serverMeta)
 	}
 }
 
@@ -518,5 +522,6 @@ func (s *Server) lanNodeFailed(me serf.MemberEvent) {
 
 		// Update id to address map
 		s.serverLookup.RemoveServer(serverMeta)
+		s.router.RemoveServer(types.AreaLAN, serverMeta)
 	}
 }

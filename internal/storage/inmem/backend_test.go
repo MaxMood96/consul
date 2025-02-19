@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package inmem_test
 
@@ -15,6 +15,9 @@ import (
 )
 
 func TestBackend_Conformance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
 	conformance.Test(t, conformance.TestOptions{
 		NewBackend: func(t *testing.T) storage.Backend {
 			backend, err := inmem.NewBackend()

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package resource
 
 import (
@@ -5,23 +8,54 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/oklog/ulid/v2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/oklog/ulid/v2"
-
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/internal/resource"
 	"github.com/hashicorp/consul/internal/storage"
 	"github.com/hashicorp/consul/proto-public/pbresource"
 )
 
 func (s *Server) WriteStatus(ctx context.Context, req *pbresource.WriteStatusRequest) (*pbresource.WriteStatusResponse, error) {
-	if err := validateWriteStatusRequest(req); err != nil {
+	reg, err := s.validateWriteStatusRequest(req)
+	if err != nil {
 		return nil, err
 	}
 
-	_, err := s.resolveType(req.Id.Type)
+	entMeta := v2TenancyToV1EntMeta(req.Id.Tenancy)
+	authz, authzContext, err := s.getAuthorizer(tokenFromContext(ctx), entMeta)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply defaults when tenancy units empty.
+	v1EntMetaToV2Tenancy(reg, entMeta, req.Id.Tenancy)
+
+	// Check tenancy exists for the V2 resource. Ignore "marked for deletion" since status updates
+	// should still work regardless.
+	if err = tenancyExists(reg, s.TenancyBridge, req.Id.Tenancy, codes.InvalidArgument); err != nil {
+		return nil, err
+	}
+
+	// Retrieve resource since ACL hook requires it.
+	existing, err := s.Backend.Read(ctx, storage.EventualConsistency, req.Id)
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return nil, status.Errorf(codes.NotFound, err.Error())
+	case err != nil:
+		return nil, status.Errorf(codes.Internal, "failed read: %v", err)
+	}
+
+	// Check write ACL.
+	err = reg.ACLs.Write(authz, authzContext, existing)
+	switch {
+	case acl.IsErrPermissionDenied(err):
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	case err != nil:
+		return nil, status.Errorf(codes.Internal, "failed operator:write allowed acl: %v", err)
 	}
 
 	// At the storage backend layer, all writes are CAS operations.
@@ -58,7 +92,10 @@ func (s *Server) WriteStatus(ctx context.Context, req *pbresource.WriteStatusReq
 		if resource.Status == nil {
 			resource.Status = make(map[string]*pbresource.Status)
 		}
-		resource.Status[req.Key] = req.Status
+
+		status := clone(req.Status)
+		status.UpdatedAt = timestamppb.Now()
+		resource.Status[req.Key] = status
 
 		result, err = s.Backend.WriteCAS(ctx, resource)
 		return err
@@ -76,15 +113,13 @@ func (s *Server) WriteStatus(ctx context.Context, req *pbresource.WriteStatusReq
 	return &pbresource.WriteStatusResponse{Resource: result}, nil
 }
 
-func validateWriteStatusRequest(req *pbresource.WriteStatusRequest) error {
+func (s *Server) validateWriteStatusRequest(req *pbresource.WriteStatusRequest) (*resource.Registration, error) {
 	var field string
 	switch {
 	case req.Id == nil:
 		field = "id"
 	case req.Id.Type == nil:
 		field = "id.type"
-	case req.Id.Tenancy == nil:
-		field = "id.tenancy"
 	case req.Id.Name == "":
 		field = "id.name"
 	case req.Id.Uid == "":
@@ -121,12 +156,53 @@ func validateWriteStatusRequest(req *pbresource.WriteStatusRequest) error {
 		}
 	}
 	if field != "" {
-		return status.Errorf(codes.InvalidArgument, "%s is required", field)
+		return nil, status.Errorf(codes.InvalidArgument, "%s is required", field)
+	}
+
+	if req.Status.UpdatedAt != nil {
+		return nil, status.Error(codes.InvalidArgument, "status.updated_at is automatically set and cannot be provided")
 	}
 
 	if _, err := ulid.ParseStrict(req.Status.ObservedGeneration); err != nil {
-		return status.Error(codes.InvalidArgument, "status.observed_generation is not valid")
+		return nil, status.Error(codes.InvalidArgument, "status.observed_generation is not valid")
 	}
 
-	return nil
+	// Better UX: Allow callers to pass in nil tenancy.  Defaulting and inheritance of tenancy
+	// from the request token will take place further down in the call flow.
+	if req.Id.Tenancy == nil {
+		req.Id.Tenancy = &pbresource.Tenancy{
+			Partition: "",
+			Namespace: "",
+		}
+	}
+
+	if err := validateId(req.Id, "id"); err != nil {
+		return nil, err
+	}
+
+	for i, condition := range req.Status.Conditions {
+		if condition.Resource != nil {
+			if err := validateRef(condition.Resource, fmt.Sprintf("status.conditions[%d].resource", i)); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Check type exists.
+	reg, err := s.resolveType(req.Id.Type)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check scope.
+	if reg.Scope == resource.ScopePartition && req.Id.Tenancy.Namespace != "" {
+		return nil, status.Errorf(
+			codes.InvalidArgument,
+			"partition scoped resource %s cannot have a namespace. got: %s",
+			resource.ToGVK(req.Id.Type),
+			req.Id.Tenancy.Namespace,
+		)
+	}
+
+	return reg, nil
 }

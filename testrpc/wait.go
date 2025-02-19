@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package testrpc
 
@@ -44,6 +44,37 @@ func WaitForLeader(t *testing.T, rpc rpcFn, dc string, options ...waitOption) {
 		if out.Index < 2 {
 			r.Fatalf("Consul index should be at least 2 in %s", dc)
 		}
+	})
+}
+
+// WaitForRaftLeader is a V2-compatible version of WaitForLeader.
+// Unlike WaitForLeader, it requires a token with operator:read access.
+func WaitForRaftLeader(t *testing.T, rpc rpcFn, dc string, options ...waitOption) {
+	t.Helper()
+
+	flat := flattenOptions(options)
+	if flat.WaitForAntiEntropySync {
+		t.Fatalf("WaitForRaftLeader doesn't accept the WaitForAntiEntropySync option")
+	}
+
+	var out structs.RaftConfigurationResponse
+	retry.Run(t, func(r *retry.R) {
+		args := &structs.DCSpecificRequest{
+			Datacenter:   dc,
+			QueryOptions: structs.QueryOptions{Token: flat.Token},
+		}
+		if err := rpc(context.Background(), "Operator.RaftGetConfiguration", args, &out); err != nil {
+			r.Fatalf("Operator.RaftGetConfiguration failed: %v", err)
+		}
+		// Don't check the Raft index. With other things are going on in V2 the assumption the index >= 2 is
+		// no longer valid.
+
+		for _, server := range out.Servers {
+			if server.Leader {
+				return
+			}
+		}
+		r.Fatalf("No leader")
 	})
 }
 
@@ -108,6 +139,7 @@ func WaitForTestAgent(t *testing.T, rpc rpcFn, dc string, options ...waitOption)
 	var checks structs.IndexedHealthChecks
 
 	retry.Run(t, func(r *retry.R) {
+		r.Helper()
 		dcReq := &structs.DCSpecificRequest{
 			Datacenter:   dc,
 			QueryOptions: structs.QueryOptions{Token: flat.Token},

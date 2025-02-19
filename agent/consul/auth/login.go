@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package auth
 
@@ -46,7 +46,9 @@ func (l *Login) TokenForVerifiedIdentity(identity *authmethod.Identity, authMeth
 		ExpirationTTL:     authMethod.MaxTokenTTL,
 		ServiceIdentities: bindings.ServiceIdentities,
 		NodeIdentities:    bindings.NodeIdentities,
+		TemplatedPolicies: bindings.TemplatedPolicies,
 		Roles:             bindings.Roles,
+		Policies:          bindings.Policies,
 		EnterpriseMeta:    bindings.EnterpriseMeta,
 	}
 	token.ACLAuthMethodEnterpriseMeta.FillWithEnterpriseMeta(&authMethod.EnterpriseMeta)

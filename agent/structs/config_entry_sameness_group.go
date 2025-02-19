@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -16,8 +16,17 @@ type SamenessGroupConfigEntry struct {
 	IncludeLocal       bool `json:",omitempty" alias:"include_local"`
 	Members            []SamenessGroupMember
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (s *SamenessGroupConfigEntry) SetHash(h uint64) {
+	s.Hash = h
+}
+
+func (s *SamenessGroupConfigEntry) GetHash() uint64 {
+	return s.Hash
 }
 
 func (s *SamenessGroupConfigEntry) GetKind() string            { return SamenessGroup }
@@ -45,6 +54,12 @@ func (s *SamenessGroupConfigEntry) Normalize() error {
 		return fmt.Errorf("config entry is nil")
 	}
 	s.EnterpriseMeta.Normalize()
+	h, err := HashConfigEntry(s)
+	if err != nil {
+		return err
+	}
+	s.Hash = h
+
 	return nil
 }
 
@@ -71,6 +86,6 @@ func (s *SamenessGroupConfigEntry) MarshalJSON() ([]byte, error) {
 }
 
 type SamenessGroupMember struct {
-	Partition string
-	Peer      string
+	Partition string `json:",omitempty"`
+	Peer      string `json:",omitempty"`
 }

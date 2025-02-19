@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package peerstream
 
@@ -30,7 +30,7 @@ func (c *MockClient) Send(r *pbpeerstream.ReplicationMessage) error {
 }
 
 func (c *MockClient) Recv() (*pbpeerstream.ReplicationMessage, error) {
-	return c.RecvWithTimeout(10 * time.Millisecond)
+	return c.RecvWithTimeout(100 * time.Millisecond)
 }
 
 func (c *MockClient) RecvWithTimeout(dur time.Duration) (*pbpeerstream.ReplicationMessage, error) {

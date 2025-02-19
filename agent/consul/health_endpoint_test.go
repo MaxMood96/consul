@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -15,7 +15,7 @@ import (
 
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
@@ -193,8 +193,8 @@ func TestHealth_ChecksInState_DistanceSort(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	updates := structs.Coordinates{
-		{Node: "foo", Coord: lib.GenerateCoordinate(1 * time.Millisecond)},
-		{Node: "bar", Coord: lib.GenerateCoordinate(2 * time.Millisecond)},
+		{Node: "foo", Coord: librtt.GenerateCoordinate(1 * time.Millisecond)},
+		{Node: "bar", Coord: librtt.GenerateCoordinate(2 * time.Millisecond)},
 	}
 	if err := s1.fsm.State().CoordinateBatchUpdate(3, updates); err != nil {
 		t.Fatalf("err: %v", err)
@@ -482,8 +482,8 @@ func TestHealth_ServiceChecks_DistanceSort(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	updates := structs.Coordinates{
-		{Node: "foo", Coord: lib.GenerateCoordinate(1 * time.Millisecond)},
-		{Node: "bar", Coord: lib.GenerateCoordinate(2 * time.Millisecond)},
+		{Node: "foo", Coord: librtt.GenerateCoordinate(1 * time.Millisecond)},
+		{Node: "bar", Coord: librtt.GenerateCoordinate(2 * time.Millisecond)},
 	}
 	if err := s1.fsm.State().CoordinateBatchUpdate(3, updates); err != nil {
 		t.Fatalf("err: %v", err)
@@ -969,8 +969,8 @@ func TestHealth_ServiceNodes_DistanceSort(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	updates := structs.Coordinates{
-		{Node: "foo", Coord: lib.GenerateCoordinate(1 * time.Millisecond)},
-		{Node: "bar", Coord: lib.GenerateCoordinate(2 * time.Millisecond)},
+		{Node: "foo", Coord: librtt.GenerateCoordinate(1 * time.Millisecond)},
+		{Node: "bar", Coord: librtt.GenerateCoordinate(2 * time.Millisecond)},
 	}
 	if err := s1.fsm.State().CoordinateBatchUpdate(3, updates); err != nil {
 		t.Fatalf("err: %v", err)
@@ -1125,7 +1125,7 @@ node "foo" {
 		QueryOptions: structs.QueryOptions{Token: token},
 	}
 	var resp structs.IndexedCheckServiceNodes
-	assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &resp))
+	assert.ErrorContains(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &resp), "Permission denied")
 	assert.Len(t, resp.Nodes, 0)
 
 	// List w/ token. This should work since we're requesting "foo", but should
@@ -1464,7 +1464,7 @@ func TestHealth_ServiceNodes_Ingress_ACL(t *testing.T) {
 		ServiceName: "db",
 		Ingress:     true,
 	}
-	require.Nil(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &out2))
+	require.ErrorContains(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &out2), "Permission denied")
 	require.Len(t, out2.Nodes, 0)
 
 	// Requesting a service that is not covered by the token's policy
@@ -1474,7 +1474,7 @@ func TestHealth_ServiceNodes_Ingress_ACL(t *testing.T) {
 		Ingress:      true,
 		QueryOptions: structs.QueryOptions{Token: token.SecretID},
 	}
-	require.Nil(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &out2))
+	require.ErrorContains(t, msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &req, &out2), "Permission denied")
 	require.Len(t, out2.Nodes, 0)
 
 	// Requesting service covered by the token's policy
@@ -1527,11 +1527,62 @@ func TestHealth_NodeChecks_FilterACL(t *testing.T) {
 	require.True(t, found, "bad: %#v", reply.HealthChecks)
 	require.True(t, reply.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	const bexprMatchingUserTokenPermissions = "ServiceName matches `f.*`"
+	const bexprNotMatchingUserTokenPermissions = "ServiceName matches `b.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+
+		if err := msgpackrpc.CallWithCodec(codec, "Health.NodeChecks", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+
+		if err := msgpackrpc.CallWithCodec(codec, "Health.NodeChecks", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		opt := structs.NodeSpecificRequest{
+			Datacenter: "dc1",
+			Node:       srv.config.NodeName,
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+
+		if err := msgpackrpc.CallWithCodec(codec, "Health.NodeChecks", &opt, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.HealthChecks))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestHealth_ServiceChecks_FilterACL(t *testing.T) {
@@ -1571,11 +1622,77 @@ func TestHealth_ServiceChecks_FilterACL(t *testing.T) {
 	require.Empty(t, reply.HealthChecks)
 	require.True(t, reply.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	// Register a service of the same name on the denied node
+	regArg := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "node-deny",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "foo",
+			Service: "foo",
+		},
+		Check: &structs.HealthCheck{
+			CheckID:   "service:foo",
+			Name:      "service:foo",
+			ServiceID: "foo",
+			Status:    api.HealthPassing,
+		},
+		WriteRequest: structs.WriteRequest{Token: "root"},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &regArg, nil); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	const bexprMatchingUserTokenPermissions = "ServiceName matches `f.*`"
+	const bexprNotMatchingUserTokenPermissions = "Node matches `node-deny.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceChecks", &opt, &reply)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceChecks", &opt, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceChecks", &opt, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.HealthChecks))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestHealth_ServiceNodes_FilterACL(t *testing.T) {
@@ -1607,11 +1724,77 @@ func TestHealth_ServiceNodes_FilterACL(t *testing.T) {
 	require.Empty(t, reply.Nodes)
 	require.True(t, reply.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	// Register a service of the same name on the denied node
+	regArg := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "node-deny",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "foo",
+			Service: "foo",
+		},
+		Check: &structs.HealthCheck{
+			CheckID:   "service:foo",
+			Name:      "service:foo",
+			ServiceID: "foo",
+			Status:    api.HealthPassing,
+		},
+		WriteRequest: structs.WriteRequest{Token: "root"},
+	}
+	if err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &regArg, nil); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	const bexprMatchingUserTokenPermissions = "Service.Service matches `f.*`"
+	const bexprNotMatchingUserTokenPermissions = "Node.Node matches `node-deny.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedCheckServiceNodes{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &opt, &reply)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, len(reply.Nodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedCheckServiceNodes{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &opt, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.Nodes))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		opt := structs.ServiceSpecificRequest{
+			Datacenter:  "dc1",
+			ServiceName: "foo",
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedCheckServiceNodes{}
+		err := msgpackrpc.CallWithCodec(codec, "Health.ServiceNodes", &opt, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.Nodes))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestHealth_ChecksInState_FilterACL(t *testing.T) {
@@ -1647,11 +1830,59 @@ func TestHealth_ChecksInState_FilterACL(t *testing.T) {
 	require.True(t, found, "missing service 'foo': %#v", reply.HealthChecks)
 	require.True(t, reply.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
 
-	// We've already proven that we call the ACL filtering function so we
-	// test node filtering down in acl.go for node cases. This also proves
-	// that we respect the version 8 ACL flag, since the test server sets
-	// that to false (the regression value of *not* changing this is better
-	// for now until we change the sense of the version 8 ACL flag).
+	const bexprMatchingUserTokenPermissions = "ServiceName matches `f.*`"
+	const bexprNotMatchingUserTokenPermissions = "ServiceName matches `b.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.ChecksInStateRequest{
+			Datacenter: "dc1",
+			State:      api.HealthPassing,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		if err := msgpackrpc.CallWithCodec(codec, "Health.ChecksInState", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Equal(t, 1, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req := structs.ChecksInStateRequest{
+			Datacenter: "dc1",
+			State:      api.HealthPassing,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		if err := msgpackrpc.CallWithCodec(codec, "Health.ChecksInState", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.HealthChecks))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req := structs.ChecksInStateRequest{
+			Datacenter: "dc1",
+			State:      api.HealthPassing,
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		reply := structs.IndexedHealthChecks{}
+		if err := msgpackrpc.CallWithCodec(codec, "Health.ChecksInState", &req, &reply); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		require.Zero(t, len(reply.HealthChecks))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestHealth_RPC_Filter(t *testing.T) {
@@ -1764,6 +1995,12 @@ func TestHealth_RPC_Filter(t *testing.T) {
 		require.Len(t, out.HealthChecks, 1)
 
 		args.State = api.HealthWarning
+		out = new(structs.IndexedHealthChecks)
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Health.ChecksInState", &args, out))
+		require.Len(t, out.HealthChecks, 1)
+
+		args.State = api.HealthAny
+		args.Filter = "connect in ServiceTags and v2 in ServiceTags"
 		out = new(structs.IndexedHealthChecks)
 		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Health.ChecksInState", &args, out))
 		require.Len(t, out.HealthChecks, 1)

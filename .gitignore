@@ -10,6 +10,7 @@
 .vagrant/
 /pkg
 bin/
+workdir/
 changelog.tmp
 exit-code
 Thumbs.db
@@ -18,6 +19,7 @@ Thumbs.db
 __debug_bin
 coverage.out
 *.tmp
+.zed
 
 # MacOS
 .DS_Store
@@ -66,3 +68,9 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+/go.work
+/go.work.sum
+.docker
+
+# Avoid accidental commits of consul-k8s submodule used by some dev environments
+consul-k8s/

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -25,6 +25,7 @@ var allConnectKind = []string{
 	string(structs.ServiceKindIngressGateway),
 	string(structs.ServiceKindMeshGateway),
 	string(structs.ServiceKindTerminatingGateway),
+	string(structs.ServiceKindAPIGateway),
 	connectNativeInstancesTable,
 }
 
@@ -409,7 +410,7 @@ func (s *Store) PeeringUsage() (uint64, PeeringUsage, error) {
 
 // ServiceUsage returns the latest seen Raft index, a compiled set of service
 // usage data, and any errors.
-func (s *Store) ServiceUsage(ws memdb.WatchSet) (uint64, structs.ServiceUsage, error) {
+func (s *Store) ServiceUsage(ws memdb.WatchSet, tenantUsage bool) (uint64, structs.ServiceUsage, error) {
 	tx := s.db.ReadTxn()
 	defer tx.Abort()
 
@@ -421,6 +422,11 @@ func (s *Store) ServiceUsage(ws memdb.WatchSet) (uint64, structs.ServiceUsage, e
 	services, err := firstUsageEntry(ws, tx, serviceNamesUsageTable)
 	if err != nil {
 		return 0, structs.ServiceUsage{}, fmt.Errorf("failed services lookup: %s", err)
+	}
+
+	nodes, err := firstUsageEntry(ws, tx, tableNodes)
+	if err != nil {
+		return 0, structs.ServiceUsage{}, fmt.Errorf("failed nodes lookup: %s", err)
 	}
 
 	serviceKindInstances := make(map[string]int)
@@ -442,7 +448,14 @@ func (s *Store) ServiceUsage(ws memdb.WatchSet) (uint64, structs.ServiceUsage, e
 		Services:                 services.Count,
 		ConnectServiceInstances:  serviceKindInstances,
 		BillableServiceInstances: billableServiceInstances.Count,
+		Nodes:                    nodes.Count,
 	}
+
+	// Unless we need to gather per-tenant usage go ahead and return what we have
+	if !tenantUsage {
+		return serviceInstances.Index, usage, nil
+	}
+
 	results, err := compileEnterpriseServiceUsage(ws, tx, usage)
 	if err != nil {
 		return 0, structs.ServiceUsage{}, fmt.Errorf("failed services lookup: %s", err)

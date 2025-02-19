@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfg
 
@@ -102,6 +102,7 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 		if err := s.resetWatchesFromChain(ctx, uid, resp.Chain, upstreamsSnapshot); err != nil {
 			return err
 		}
+		reconcilePeeringWatches(upstreamsSnapshot.DiscoveryChain, upstreamsSnapshot.UpstreamConfig, upstreamsSnapshot.PeeredUpstreams, upstreamsSnapshot.PeerUpstreamEndpoints, upstreamsSnapshot.UpstreamPeerTrustBundles)
 
 	case strings.HasPrefix(u.CorrelationID, upstreamPeerWatchIDPrefix):
 		resp, ok := u.Result.(*structs.IndexedCheckServiceNodes)
@@ -136,6 +137,10 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 
 		uid := UpstreamIDFromString(uidString)
 
+		s.logger.Debug("upstream-target watch fired",
+			"correlationID", correlationID,
+			"nodes", len(resp.Nodes),
+		)
 		if _, ok := upstreamsSnapshot.WatchedUpstreamEndpoints[uid]; !ok {
 			upstreamsSnapshot.WatchedUpstreamEndpoints[uid] = make(map[string]structs.CheckServiceNodes)
 		}
@@ -297,12 +302,6 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 		delete(snap.WatchedUpstreams[uid], targetID)
 		delete(snap.WatchedUpstreamEndpoints[uid], targetID)
 		cancelFn()
-
-		targetUID := NewUpstreamIDFromTargetID(targetID)
-		if targetUID.Peer != "" {
-			snap.PeerUpstreamEndpoints.CancelWatch(targetUID)
-			snap.UpstreamPeerTrustBundles.CancelWatch(targetUID.Peer)
-		}
 	}
 
 	var (
@@ -316,8 +315,19 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			watchedChainEndpoints = true
 		}
 
-		opts := targetWatchOpts{upstreamID: uid}
-		opts.fromChainTarget(target)
+		opts := targetWatchOpts{
+			upstreamID: uid,
+			chainID:    target.ID,
+			service:    target.Service,
+			filter:     target.Subset.Filter,
+			datacenter: target.Datacenter,
+			peer:       target.Peer,
+			entMeta:    target.GetEnterpriseMetadata(),
+		}
+		// Peering targets do not set the datacenter field, so we should default it here.
+		if opts.datacenter == "" {
+			opts.datacenter = s.source.Datacenter
+		}
 
 		err := s.watchUpstreamTarget(ctx, snap, opts)
 		if err != nil {
@@ -338,6 +348,14 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			gk = GatewayKey{
 				Partition:  s.proxyID.PartitionOrDefault(),
 				Datacenter: s.source.Datacenter,
+			}
+		default:
+			// if target.MeshGateway.Mode is not set and target is not peered we don't want to set up watches for the gateway.
+			// This is important specifically in wan-fed without mesh gateway use case, as for this case
+			//the source and target DC could be different but there is not  mesh-gateway so no need to watch
+			// a costly watch (Internal.ServiceDump)
+			if target.Peer == "" {
+				continue
 			}
 		}
 		if s.source.Datacenter != target.Datacenter || s.proxyID.PartitionOrDefault() != target.Partition {
@@ -378,6 +396,7 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 		if _, ok := snap.WatchedGateways[uid][key]; ok {
 			continue
 		}
+
 		gwKey := gatewayKeyFromString(key)
 
 		s.logger.Trace("initializing watch of mesh gateway",
@@ -396,13 +415,14 @@ func (s *handlerUpstreams) resetWatchesFromChain(
 			key:                 gwKey,
 			upstreamID:          uid,
 		}
+
 		err := watchMeshGateway(ctx, opts)
 		if err != nil {
 			cancel()
 			return err
 		}
-
 		snap.WatchedGateways[uid][key] = cancel
+
 	}
 
 	for key, cancelFn := range snap.WatchedGateways[uid] {
@@ -435,15 +455,6 @@ type targetWatchOpts struct {
 	entMeta    *acl.EnterpriseMeta
 }
 
-func (o *targetWatchOpts) fromChainTarget(t *structs.DiscoveryTarget) {
-	o.chainID = t.ID
-	o.service = t.Service
-	o.filter = t.Subset.Filter
-	o.datacenter = t.Datacenter
-	o.peer = t.Peer
-	o.entMeta = t.GetEnterpriseMetadata()
-}
-
 func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *ConfigSnapshotUpstreams, opts targetWatchOpts) error {
 	s.logger.Trace("initializing watch of target",
 		"upstream", opts.upstreamID,
@@ -463,8 +474,8 @@ func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *Config
 	var entMeta acl.EnterpriseMeta
 	entMeta.Merge(opts.entMeta)
 
-	ctx, cancel := context.WithCancel(ctx)
-	err := s.dataSources.Health.Notify(ctx, &structs.ServiceSpecificRequest{
+	peerCtx, cancel := context.WithCancel(ctx)
+	err := s.dataSources.Health.Notify(peerCtx, &structs.ServiceSpecificRequest{
 		PeerName:   opts.peer,
 		Datacenter: opts.datacenter,
 		QueryOptions: structs.QueryOptions{
@@ -490,25 +501,25 @@ func (s *handlerUpstreams) watchUpstreamTarget(ctx context.Context, snap *Config
 		return nil
 	}
 
-	if ok := snap.PeerUpstreamEndpoints.IsWatched(uid); !ok {
+	if !snap.PeerUpstreamEndpoints.IsWatched(uid) {
 		snap.PeerUpstreamEndpoints.InitWatch(uid, cancel)
 	}
-
 	// Check whether a watch for this peer exists to avoid duplicates.
-	if ok := snap.UpstreamPeerTrustBundles.IsWatched(uid.Peer); !ok {
-		peerCtx, cancel := context.WithCancel(ctx)
-		if err := s.dataSources.TrustBundle.Notify(peerCtx, &cachetype.TrustBundleReadRequest{
+
+	if !snap.UpstreamPeerTrustBundles.IsWatched(uid.Peer) {
+		peerCtx2, cancel2 := context.WithCancel(ctx)
+		if err := s.dataSources.TrustBundle.Notify(peerCtx2, &cachetype.TrustBundleReadRequest{
 			Request: &pbpeering.TrustBundleReadRequest{
 				Name:      uid.Peer,
 				Partition: uid.PartitionOrDefault(),
 			},
 			QueryOptions: structs.QueryOptions{Token: s.token},
 		}, peerTrustBundleIDPrefix+uid.Peer, s.ch); err != nil {
-			cancel()
+			cancel2()
 			return fmt.Errorf("error while watching trust bundle for peer %q: %w", uid.Peer, err)
 		}
 
-		snap.UpstreamPeerTrustBundles.InitWatch(uid.Peer, cancel)
+		snap.UpstreamPeerTrustBundles.InitWatch(uid.Peer, cancel2)
 	}
 
 	return nil

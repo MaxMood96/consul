@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package lib
 
@@ -113,7 +113,7 @@ func (w *mapWalker) MapElem(m, k, v reflect.Value) error {
 		return nil
 	}
 
-	if inner := v.Elem(); inner.Type() == typMapIfaceIface {
+	if inner := v.Elem(); inner.IsValid() && inner.Type() == typMapIfaceIface {
 		// map[interface{}]interface{}, attempt to weakly decode into string keys
 		var target map[string]interface{}
 		if err := mapstructure.WeakDecode(v.Interface(), &target); err != nil {

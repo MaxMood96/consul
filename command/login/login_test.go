@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package login
 
@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/mitchellh/cli"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/square/go-jose.v2/jwt"
 
 	"github.com/hashicorp/consul-awsauth/iamauthtest"
 	"github.com/hashicorp/consul/agent"

@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -36,6 +37,8 @@ import (
 	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/consul/types"
 )
+
+const localTestDC = "dc1"
 
 func TestPreparedQuery_Apply(t *testing.T) {
 	if testing.Short() {
@@ -1536,8 +1539,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		assert.Len(t, reply.Nodes, 0)
 	})
 
-	expectNodes := func(t *testing.T, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
-		t.Helper()
+	expectNodes := func(t require.TestingT, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
 		assert.Len(t, reply.Nodes, n)
 		assert.Equal(t, "dc1", reply.Datacenter)
 		assert.Equal(t, 0, reply.Failovers)
@@ -1545,8 +1547,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		assert.Equal(t, query.Query.DNS, reply.DNS)
 		assert.True(t, reply.QueryMeta.KnownLeader)
 	}
-	expectFailoverNodes := func(t *testing.T, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
-		t.Helper()
+	expectFailoverNodes := func(t require.TestingT, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
 		assert.Len(t, reply.Nodes, n)
 		assert.Equal(t, "dc2", reply.Datacenter)
 		assert.Equal(t, 1, reply.Failovers)
@@ -1555,8 +1556,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		assert.True(t, reply.QueryMeta.KnownLeader)
 	}
 
-	expectFailoverPeerNodes := func(t *testing.T, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
-		t.Helper()
+	expectFailoverPeerNodes := func(t require.TestingT, query *structs.PreparedQueryRequest, reply *structs.PreparedQueryExecuteResponse, n int) {
 		assert.Len(t, reply.Nodes, n)
 		assert.Equal(t, "", reply.Datacenter)
 		assert.Equal(t, es.peeringServer.acceptingPeerName, reply.PeerName)
@@ -2369,13 +2369,13 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			}
 
 			var reply structs.PreparedQueryExecuteResponse
-			require.NoError(t, msgpackrpc.CallWithCodec(es.server.codec, "PreparedQuery.Execute", &req, &reply))
+			require.NoError(r, msgpackrpc.CallWithCodec(es.server.codec, "PreparedQuery.Execute", &req, &reply))
 
 			for _, node := range reply.Nodes {
-				assert.NotEqual(t, "node3", node.Node.Node)
+				assert.NotEqual(r, "node3", node.Node.Node)
 			}
 
-			expectNodes(t, &query, &reply, 9)
+			expectNodes(r, &query, &reply, 9)
 		})
 	})
 }
@@ -2808,19 +2808,23 @@ func TestPreparedQuery_Wrapper(t *testing.T) {
 		t.Fatalf("bad: %v", ret)
 	}
 	// Since we have no idea when the joinWAN operation completes
-	// we keep on querying until the the join operation completes.
+	// we keep on querying until the join operation completes.
 	retry.Run(t, func(r *retry.R) {
 		r.Check(s1.forwardDC("Status.Ping", "dc2", &struct{}{}, &struct{}{}))
 	})
 }
 
+var _ queryServer = (*mockQueryServer)(nil)
+
 type mockQueryServer struct {
+	queryServerWrapper
 	Datacenters      []string
 	DatacentersError error
 	QueryLog         []string
 	QueryFn          func(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error
 	Logger           hclog.Logger
 	LogBuffer        *bytes.Buffer
+	SamenessGroup    map[string]*structs.SamenessGroupConfigEntry
 }
 
 func (m *mockQueryServer) JoinQueryLog() string {
@@ -2841,7 +2845,7 @@ func (m *mockQueryServer) GetLogger() hclog.Logger {
 }
 
 func (m *mockQueryServer) GetLocalDC() string {
-	return "dc1"
+	return localTestDC
 }
 
 func (m *mockQueryServer) GetOtherDatacentersByDistance() ([]string, error) {
@@ -2850,19 +2854,53 @@ func (m *mockQueryServer) GetOtherDatacentersByDistance() ([]string, error) {
 
 func (m *mockQueryServer) ExecuteRemote(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error {
 	peerName := args.Query.Service.Peer
+	partitionName := args.Query.Service.PartitionOrEmpty()
+	namespaceName := args.Query.Service.NamespaceOrEmpty()
 	dc := args.Datacenter
 	if peerName != "" {
 		m.QueryLog = append(m.QueryLog, fmt.Sprintf("peer:%s", peerName))
+	} else if partitionName != "" {
+		m.QueryLog = append(m.QueryLog, fmt.Sprintf("partition:%s", partitionName))
+	} else if namespaceName != "" {
+		m.QueryLog = append(m.QueryLog, fmt.Sprintf("namespace:%s", namespaceName))
 	} else {
 		m.QueryLog = append(m.QueryLog, fmt.Sprintf("%s:%s", dc, "PreparedQuery.ExecuteRemote"))
 	}
 	reply.PeerName = peerName
 	reply.Datacenter = dc
+	reply.EnterpriseMeta = acl.NewEnterpriseMetaWithPartition(partitionName, namespaceName)
 
 	if m.QueryFn != nil {
 		return m.QueryFn(args, reply)
 	}
 	return nil
+}
+
+type mockStateLookup struct {
+	SamenessGroup map[string]*structs.SamenessGroupConfigEntry
+}
+
+func (sl mockStateLookup) samenessGroupLookup(name string, entMeta acl.EnterpriseMeta) (uint64, *structs.SamenessGroupConfigEntry, error) {
+	lookup := name
+	if ap := entMeta.PartitionOrEmpty(); ap != "" {
+		lookup = fmt.Sprintf("%s-%s", lookup, ap)
+	} else if ns := entMeta.NamespaceOrEmpty(); ns != "" {
+		lookup = fmt.Sprintf("%s-%s", lookup, ns)
+	}
+
+	sg, ok := sl.SamenessGroup[lookup]
+	if !ok {
+		return 0, nil, errors.New("unable to find sameness group")
+	}
+
+	return 0, sg, nil
+}
+
+func (m *mockQueryServer) GetSamenessGroupFailoverTargets(name string, entMeta acl.EnterpriseMeta) ([]structs.QueryFailoverTarget, error) {
+	m.sl = mockStateLookup{
+		SamenessGroup: m.SamenessGroup,
+	}
+	return m.queryServerWrapper.GetSamenessGroupFailoverTargets(name, entMeta)
 }
 
 func TestPreparedQuery_queryFailover(t *testing.T) {
@@ -3319,6 +3357,7 @@ type executeServers struct {
 
 func createExecuteServers(t *testing.T) *executeServers {
 	es := newExecuteServers(t)
+	es.initPeering(t, "")
 	es.initWanFed(t)
 	es.exportPeeringServices(t)
 	es.initTokens(t)
@@ -3327,7 +3366,6 @@ func createExecuteServers(t *testing.T) *executeServers {
 }
 
 func newExecuteServers(t *testing.T) *executeServers {
-
 	// Setup server
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.PrimaryDatacenter = "dc1"
@@ -3378,67 +3416,6 @@ func newExecuteServers(t *testing.T) *executeServers {
 	testrpc.WaitForLeader(t, s1.RPC, "dc1", testrpc.WithToken("root"))
 	testrpc.WaitForLeader(t, s3.RPC, "dc3")
 
-	acceptingPeerName := "my-peer-accepting-server"
-	dialingPeerName := "my-peer-dialing-server"
-
-	// Set up peering between dc1 (dialing) and dc3 (accepting) and export the foo service
-	{
-		// Create a peering by generating a token.
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		t.Cleanup(cancel)
-
-		options := structs.QueryOptions{Token: "root"}
-		ctx, err := grpcexternal.ContextWithQueryOptions(ctx, options)
-		require.NoError(t, err)
-
-		conn, err := grpc.DialContext(ctx, s3.config.RPCAddr.String(),
-			grpc.WithContextDialer(newServerDialer(s3.config.RPCAddr.String())),
-			//nolint:staticcheck
-			grpc.WithInsecure(),
-			grpc.WithBlock())
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			conn.Close()
-		})
-
-		peeringClient := pbpeering.NewPeeringServiceClient(conn)
-		req := pbpeering.GenerateTokenRequest{
-			PeerName: dialingPeerName,
-		}
-		resp, err := peeringClient.GenerateToken(ctx, &req)
-		require.NoError(t, err)
-
-		conn, err = grpc.DialContext(ctx, s1.config.RPCAddr.String(),
-			grpc.WithContextDialer(newServerDialer(s1.config.RPCAddr.String())),
-			//nolint:staticcheck
-			grpc.WithInsecure(),
-			grpc.WithBlock())
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			conn.Close()
-		})
-
-		peeringClient = pbpeering.NewPeeringServiceClient(conn)
-		establishReq := pbpeering.EstablishRequest{
-			PeerName:     acceptingPeerName,
-			PeeringToken: resp.PeeringToken,
-		}
-		establishResp, err := peeringClient.Establish(ctx, &establishReq)
-		require.NoError(t, err)
-		require.NotNil(t, establishResp)
-
-		readResp, err := peeringClient.PeeringRead(ctx, &pbpeering.PeeringReadRequest{Name: acceptingPeerName})
-		require.NoError(t, err)
-		require.NotNil(t, readResp)
-
-		// Wait for the stream to be connected.
-		retry.Run(t, func(r *retry.R) {
-			status, found := s1.peerStreamServer.StreamStatus(readResp.GetPeering().GetID())
-			require.True(r, found)
-			require.True(r, status.Connected)
-		})
-	}
-
 	es := executeServers{
 		server: &serverTestMetadata{
 			server:     s1,
@@ -3449,8 +3426,8 @@ func newExecuteServers(t *testing.T) *executeServers {
 			server:            s3,
 			codec:             codec3,
 			datacenter:        "dc3",
-			dialingPeerName:   dialingPeerName,
-			acceptingPeerName: acceptingPeerName,
+			dialingPeerName:   "my-peer-dialing-server",
+			acceptingPeerName: "my-peer-accepting-server",
 		},
 	}
 
@@ -3523,4 +3500,65 @@ func (es *executeServers) initWanFed(t *testing.T) {
 		codec:      codec2,
 		datacenter: "dc2",
 	}
+}
+
+func (es *executeServers) initPeering(t *testing.T, localPartition string) {
+	// Create a peering by generating a token.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	options := structs.QueryOptions{Token: "root"}
+	ctx, err := grpcexternal.ContextWithQueryOptions(ctx, options)
+	require.NoError(t, err)
+
+	conn, err := grpc.DialContext(ctx, es.peeringServer.server.config.RPCAddr.String(),
+		grpc.WithContextDialer(newServerDialer(es.peeringServer.server.config.RPCAddr.String())),
+		//nolint:staticcheck
+		grpc.WithInsecure(),
+		grpc.WithBlock())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+
+	peeringClient := pbpeering.NewPeeringServiceClient(conn)
+	req := pbpeering.GenerateTokenRequest{
+		PeerName: es.peeringServer.dialingPeerName,
+	}
+	resp, err := peeringClient.GenerateToken(ctx, &req)
+	require.NoError(t, err)
+
+	conn, err = grpc.DialContext(ctx, es.server.server.config.RPCAddr.String(),
+		grpc.WithContextDialer(newServerDialer(es.server.server.config.RPCAddr.String())),
+		//nolint:staticcheck
+		grpc.WithInsecure(),
+		grpc.WithBlock())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+
+	peeringClient = pbpeering.NewPeeringServiceClient(conn)
+	establishReq := pbpeering.EstablishRequest{
+		Partition:    localPartition,
+		PeerName:     es.peeringServer.acceptingPeerName,
+		PeeringToken: resp.PeeringToken,
+	}
+	establishResp, err := peeringClient.Establish(ctx, &establishReq)
+	require.NoError(t, err)
+	require.NotNil(t, establishResp)
+
+	readResp, err := peeringClient.PeeringRead(ctx, &pbpeering.PeeringReadRequest{
+		Partition: localPartition,
+		Name:      es.peeringServer.acceptingPeerName,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, readResp)
+
+	// Wait for the stream to be connected.
+	retry.Run(t, func(r *retry.R) {
+		status, found := es.server.server.peerStreamServer.StreamStatus(readResp.GetPeering().GetID())
+		require.True(r, found)
+		require.True(r, status.Connected)
+	})
 }

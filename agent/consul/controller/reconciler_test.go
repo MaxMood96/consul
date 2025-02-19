@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package controller
 
@@ -47,6 +47,7 @@ func (r *testReconciler) setResponse(err error) {
 func (r *testReconciler) step() {
 	r.stepChan <- struct{}{}
 }
+
 func (r *testReconciler) stepFor(duration time.Duration) {
 	select {
 	case r.stepChan <- struct{}{}:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 
 set -euo pipefail
@@ -54,6 +54,17 @@ routes = [
   },
   {
     match { http { path_prefix = "/prefix-alt/" } }
+    destination {
+      service_subset = "v1"
+      prefix_rewrite = "/"
+    }
+  },
+  {
+    match { http {
+      path_prefix = "/prefix-case-insensitive/"
+      case_insensitive = true
+      }
+    }
     destination {
       service_subset = "v1"
       prefix_rewrite = "/"

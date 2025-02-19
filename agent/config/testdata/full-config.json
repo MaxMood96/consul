@@ -327,6 +327,9 @@
   "encrypt": "A4wELWqH",
   "encrypt_verify_incoming": true,
   "encrypt_verify_outgoing": true,
+  "experiments": [
+    "foo"
+  ],
   "http_config": {
     "block_endpoints": [
       "RBvAFcGD",
@@ -363,6 +366,10 @@
       "write_rate": 101.0
     }
   },
+  "locality": {
+    "region": "us-east-2",
+    "zone": "us-east-2b"
+  },
   "log_level": "k1zo9Spt",
   "log_json": true,
   "max_query_time": "18237s",
@@ -380,7 +387,9 @@
   "performance": {
     "leave_drain_time": "8265s",
     "raft_multiplier": 5,
-    "rpc_hold_timeout": "15707s"
+    "rpc_hold_timeout": "15707s",
+    "grpc_keepalive_interval": "33s",
+    "grpc_keepalive_timeout": "22s"
   },
   "pid_file": "43xN80Km",
   "ports": {
@@ -407,17 +416,17 @@
   "raft_snapshot_interval": "30s",
   "raft_trailing_logs": 83749,
   "raft_logstore": {
-    "backend" : "wal",
-    "disable_log_cache":  true,
+    "backend": "wal",
+    "disable_log_cache": true,
     "verification": {
-        "enabled": true,
-        "interval":"12345s"
+      "enabled": true,
+      "interval": "12345s"
     },
     "boltdb": {
-        "no_freelist_sync": true
+      "no_freelist_sync": true
     },
     "wal": {
-       "segment_size_mb": 15
+      "segment_size_mb": 15
     }
   },
   "read_replica": true,
@@ -453,6 +462,7 @@
   "serf_wan": "67.88.33.19",
   "server": true,
   "server_name": "Oerr9n1G",
+  "server_rejoin_age_max": "604800s",
   "service": {
     "id": "dLOXpSCI",
     "name": "o1ynPkp0",
@@ -592,6 +602,10 @@
     ],
     "connect": {
       "native": true
+    },
+    "locality": {
+      "region": "us-west-1",
+      "zone": "us-west-1a"
     }
   },
   "services": [
@@ -643,6 +657,10 @@
       },
       "connect": {
         "sidecar_service": {}
+      },
+      "locality": {
+        "region": "us-east-1",
+        "zone": "us-east-1a"
       }
     },
     {
@@ -807,6 +825,7 @@
     "circonus_check_tags": "prvO4uBl",
     "circonus_submission_interval": "DolzaflP",
     "circonus_submission_url": "gTcbS93G",
+    "enable_host_metrics": true,
     "disable_hostname": true,
     "dogstatsd_addr": "0wSndumK",
     "dogstatsd_tags": [
@@ -822,7 +841,8 @@
     "metrics_prefix": "ftO6DySn",
     "prometheus_retention_time": "15s",
     "statsd_address": "drce87cy",
-    "statsite_address": "HpFwKB8R"
+    "statsite_address": "HpFwKB8R",
+    "disable_per_tenancy_usage_metrics": true
   },
   "tls": {
     "defaults": {

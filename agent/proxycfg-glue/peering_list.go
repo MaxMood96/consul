@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfgglue
 
@@ -52,8 +52,8 @@ func (s *serverPeeringList) Notify(ctx context.Context, req *cachetype.PeeringLi
 				return 0, nil, err
 			}
 			return index, &pbpeering.PeeringListResponse{
-				Index:    index,
-				Peerings: peerings,
+				OBSOLETE_Index: index,
+				Peerings:       peerings,
 			}, nil
 		},
 		dispatchBlockingQueryUpdate[*pbpeering.PeeringListResponse](ch),

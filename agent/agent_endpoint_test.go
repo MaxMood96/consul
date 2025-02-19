@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
@@ -21,14 +21,14 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
-	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/serf/serf"
 	"github.com/mitchellh/hashstructure"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/serf/serf"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/acl/resolver"
@@ -41,12 +41,14 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/token"
 	tokenStore "github.com/hashicorp/consul/agent/token"
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/consul/version"
 )
 
 func createACLTokenWithAgentReadPolicy(t *testing.T, srv *HTTPHandlers) string {
@@ -431,6 +433,60 @@ func TestAgent_Services_ACLFilter(t *testing.T) {
 		require.Len(t, val, 2)
 		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
 	})
+
+	// ensure ACL filtering occurs before bexpr filtering.
+	const bexprMatchingUserTokenPermissions = "Service matches `web.*`"
+	const bexprNotMatchingUserTokenPermissions = "Service matches `api.*`"
+
+	tokenWithWebRead := testCreateToken(t, a, `
+			service "web" {
+				policy = "read"
+			}
+		`)
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/services?filter="+url.QueryEscape(bexprMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithWebRead)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		var val map[string]*api.AgentService
+		err := dec.Decode(&val)
+		if err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 1)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/services?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithWebRead)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		var val map[string]*api.AgentService
+		err := dec.Decode(&val)
+		if err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/services?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		var val map[string]*api.AgentService
+		err := dec.Decode(&val)
+		if err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
+		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
 }
 
 func TestAgent_Service(t *testing.T) {
@@ -736,9 +792,6 @@ func TestAgent_Service(t *testing.T) {
 			if tt.wantWait != 0 {
 				assert.True(t, elapsed >= tt.wantWait, "should have waited at least %s, "+
 					"took %s", tt.wantWait, elapsed)
-			} else {
-				assert.True(t, elapsed < 10*time.Millisecond, "should not have waited, "+
-					"took %s", elapsed)
 			}
 
 			if tt.wantResp != nil {
@@ -1433,6 +1486,57 @@ func TestAgent_Checks_ACLFilter(t *testing.T) {
 		require.Len(t, val, 2)
 		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
 	})
+
+	// ensure ACL filtering occurs before bexpr filtering.
+	const bexprMatchingUserTokenPermissions = "ServiceName matches `web.*`"
+	const bexprNotMatchingUserTokenPermissions = "ServiceName matches `api.*`"
+
+	tokenWithWebRead := testCreateToken(t, a, `
+			service "web" {
+				policy = "read"
+			}
+		`)
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/checks?filter="+url.QueryEscape(bexprMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithWebRead)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make(map[types.CheckID]*structs.HealthCheck)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 1)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/checks?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithWebRead)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make(map[types.CheckID]*structs.HealthCheck)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/checks?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make(map[types.CheckID]*structs.HealthCheck)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
+		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
 }
 
 func TestAgent_Self(t *testing.T) {
@@ -1505,7 +1609,8 @@ func TestAgent_Self(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, cs[a.config.SegmentName], val.Coord)
 
-			delete(val.Meta, structs.MetaSegmentKey) // Added later, not in config.
+			delete(val.Meta, structs.MetaSegmentKey)    // Added later, not in config.
+			delete(val.Meta, structs.MetaConsulVersion) // Added later, not in config.
 			require.Equal(t, a.config.NodeMeta, val.Meta)
 
 			if tc.expectXDS {
@@ -1599,14 +1704,38 @@ func TestAgent_Metrics_ACLDeny(t *testing.T) {
 	})
 }
 
+func newDefaultBaseDeps(t *testing.T) BaseDeps {
+	dataDir := testutil.TempDir(t, "acl-agent")
+	logBuffer := testutil.NewLogBuffer(t)
+	logger := hclog.NewInterceptLogger(nil)
+	loader := func(source config.Source) (config.LoadResult, error) {
+		dataDir := fmt.Sprintf(`data_dir = "%s"`, dataDir)
+		opts := config.LoadOpts{
+			HCL:           []string{TestConfigHCL(NodeID()), "", dataDir},
+			DefaultConfig: source,
+		}
+		result, err := config.Load(opts)
+		if result.RuntimeConfig != nil {
+			result.RuntimeConfig.Telemetry.Disable = true
+		}
+		return result, err
+	}
+	bd, err := NewBaseDeps(loader, logBuffer, logger)
+	require.NoError(t, err)
+	return bd
+}
+
 func TestHTTPHandlers_AgentMetricsStream_ACLDeny(t *testing.T) {
-	bd := BaseDeps{}
+	t.Skip("this test panics without a license manager in enterprise")
+	bd := newDefaultBaseDeps(t)
 	bd.Tokens = new(tokenStore.Store)
 	sink := metrics.NewInmemSink(30*time.Millisecond, time.Second)
 	bd.MetricsConfig = &lib.MetricsConfig{
 		Handler: sink,
 	}
-	d := fakeResolveTokenDelegate{authorizer: acl.DenyAll()}
+	mockDelegate := delegateMock{}
+	mockDelegate.On("LicenseCheck").Return()
+	d := fakeResolveTokenDelegate{delegate: &mockDelegate, authorizer: acl.DenyAll()}
 	agent := &Agent{
 		baseDeps: bd,
 		delegate: d,
@@ -1622,20 +1751,23 @@ func TestHTTPHandlers_AgentMetricsStream_ACLDeny(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/v1/agent/metrics/stream", nil)
 	require.NoError(t, err)
-	handle := h.handler(false)
+	handle := h.handler()
 	handle.ServeHTTP(resp, req)
 	require.Equal(t, http.StatusForbidden, resp.Code)
 	require.Contains(t, resp.Body.String(), "Permission denied")
 }
 
 func TestHTTPHandlers_AgentMetricsStream(t *testing.T) {
-	bd := BaseDeps{}
+	t.Skip("this test panics without a license manager in enterprise")
+	bd := newDefaultBaseDeps(t)
 	bd.Tokens = new(tokenStore.Store)
 	sink := metrics.NewInmemSink(20*time.Millisecond, time.Second)
 	bd.MetricsConfig = &lib.MetricsConfig{
 		Handler: sink,
 	}
-	d := fakeResolveTokenDelegate{authorizer: acl.ManageAll()}
+	mockDelegate := delegateMock{}
+	mockDelegate.On("LicenseCheck").Return()
+	d := fakeResolveTokenDelegate{delegate: &mockDelegate, authorizer: acl.ManageAll()}
 	agent := &Agent{
 		baseDeps: bd,
 		delegate: d,
@@ -1659,7 +1791,7 @@ func TestHTTPHandlers_AgentMetricsStream(t *testing.T) {
 	resp := httptest.NewRecorder()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/v1/agent/metrics/stream", nil)
 	require.NoError(t, err)
-	handle := h.handler(false)
+	handle := h.handler()
 	handle.ServeHTTP(resp, req)
 	require.Equal(t, http.StatusOK, resp.Code)
 
@@ -1813,27 +1945,27 @@ func TestAgent_ReloadDoesNotTriggerWatch(t *testing.T) {
 	require.NoError(t, a.updateTTLCheck(checkID, api.HealthPassing, "testing-agent-reload-001"))
 
 	checkStr := func(r *retry.R, evaluator func(string) error) {
-		t.Helper()
+		r.Helper()
 		contentsStr := ""
 		// Wait for watch to be populated
 		for i := 1; i < 7; i++ {
 			contents, err := os.ReadFile(tmpFile)
 			if err != nil {
-				t.Fatalf("should be able to read file, but had: %#v", err)
+				r.Fatalf("should be able to read file, but had: %#v", err)
 			}
 			contentsStr = string(contents)
 			if contentsStr != "" {
 				break
 			}
 			time.Sleep(time.Duration(i) * time.Second)
-			testutil.Logger(t).Info("Watch not yet populated, retrying")
+			testutil.Logger(r).Info("Watch not yet populated, retrying")
 		}
 		if err := evaluator(contentsStr); err != nil {
 			r.Errorf("ERROR: Test failing: %s", err)
 		}
 	}
 	ensureNothingCritical := func(r *retry.R, mustContain string) {
-		t.Helper()
+		r.Helper()
 		eval := func(contentsStr string) error {
 			if strings.Contains(contentsStr, "critical") {
 				return fmt.Errorf("MUST NOT contain critical:= %s", contentsStr)
@@ -1851,7 +1983,7 @@ func TestAgent_ReloadDoesNotTriggerWatch(t *testing.T) {
 	}
 
 	retry.RunWith(retriesWithDelay(), t, func(r *retry.R) {
-		testutil.Logger(t).Info("Consul is now ready")
+		testutil.Logger(r).Info("Consul is now ready")
 		// it should contain the output
 		checkStr(r, func(contentStr string) error {
 			if contentStr == "[]" {
@@ -1906,14 +2038,14 @@ func TestAgent_ReloadDoesNotTriggerWatch(t *testing.T) {
 		ensureNothingCritical(r, "red-is-dead")
 
 		if err := a.reloadConfigInternal(cfg2); err != nil {
-			t.Fatalf("got error %v want nil", err)
+			r.Fatalf("got error %v want nil", err)
 		}
 
 		// We check that reload does not go to critical
 		ensureNothingCritical(r, "red-is-dead")
 		ensureNothingCritical(r, "testing-agent-reload-001")
 
-		require.NoError(t, a.updateTTLCheck(checkID, api.HealthPassing, "testing-agent-reload-002"))
+		require.NoError(r, a.updateTTLCheck(checkID, api.HealthPassing, "testing-agent-reload-002"))
 
 		ensureNothingCritical(r, "red-is-dead")
 	})
@@ -2081,6 +2213,57 @@ func TestAgent_Members_ACLFilter(t *testing.T) {
 			t.Fatalf("Err: %v", err)
 		}
 		require.Len(t, val, 2)
+		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	// ensure ACL filtering occurs before bexpr filtering.
+	bexprMatchingUserTokenPermissions := fmt.Sprintf("Name matches `%s.*`", b.Config.NodeName)
+	bexprNotMatchingUserTokenPermissions := fmt.Sprintf("Name matches `%s.*`", a.Config.NodeName)
+
+	tokenWithReadOnMemberB := testCreateToken(t, a, fmt.Sprintf(`
+			node "%s" {
+				policy = "read"
+			}
+		`, b.Config.NodeName))
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/members?filter="+url.QueryEscape(bexprMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithReadOnMemberB)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make([]serf.Member, 0)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 1)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/members?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		req.Header.Add("X-Consul-Token", tokenWithReadOnMemberB)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make([]serf.Member, 0)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
+		require.NotEmpty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/v1/agent/members?filter="+url.QueryEscape(bexprNotMatchingUserTokenPermissions), nil)
+		resp := httptest.NewRecorder()
+		a.srv.h.ServeHTTP(resp, req)
+		dec := json.NewDecoder(resp.Body)
+		val := make([]serf.Member, 0)
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("Err: %v", err)
+		}
+		require.Len(t, val, 0)
 		require.Empty(t, resp.Header().Get("X-Consul-Results-Filtered-By-ACLs"))
 	})
 }
@@ -2923,7 +3106,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req, _ := http.NewRequest("PUT", "/v1/agent/check/register", jsonReader(nodeCheck))
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusForbidden, resp.Code)
+			require.Equal(r, http.StatusForbidden, resp.Code)
 		})
 	})
 
@@ -2933,7 +3116,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req.Header.Add("X-Consul-Token", svcToken.SecretID)
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusForbidden, resp.Code)
+			require.Equal(r, http.StatusForbidden, resp.Code)
 		})
 	})
 
@@ -2943,7 +3126,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req.Header.Add("X-Consul-Token", nodeToken.SecretID)
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusOK, resp.Code)
+			require.Equal(r, http.StatusOK, resp.Code)
 		})
 	})
 
@@ -2952,7 +3135,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req, _ := http.NewRequest("PUT", "/v1/agent/check/register", jsonReader(svcCheck))
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusForbidden, resp.Code)
+			require.Equal(r, http.StatusForbidden, resp.Code)
 		})
 	})
 
@@ -2962,7 +3145,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req.Header.Add("X-Consul-Token", nodeToken.SecretID)
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusForbidden, resp.Code)
+			require.Equal(r, http.StatusForbidden, resp.Code)
 		})
 	})
 
@@ -2972,7 +3155,7 @@ func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 			req.Header.Add("X-Consul-Token", svcToken.SecretID)
 			resp := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(resp, req)
-			require.Equal(t, http.StatusOK, resp.Code)
+			require.Equal(r, http.StatusOK, resp.Code)
 		})
 	})
 }
@@ -4276,7 +4459,7 @@ func testDefaultSidecar(svc string, port int, fns ...func(*structs.NodeService))
 }
 
 // testCreateToken creates a Policy for the provided rules and a Token linked to that Policy.
-func testCreateToken(t *testing.T, a *TestAgent, rules string) string {
+func testCreateToken(t testutil.TestingTB, a *TestAgent, rules string) string {
 	policyName, err := uuid.GenerateUUID() // we just need a unique name for the test and UUIDs are definitely unique
 	require.NoError(t, err)
 
@@ -4305,7 +4488,7 @@ func testCreateToken(t *testing.T, a *TestAgent, rules string) string {
 	return aclResp.SecretID
 }
 
-func testCreatePolicy(t *testing.T, a *TestAgent, name, rules string) string {
+func testCreatePolicy(t testutil.TestingTB, a *TestAgent, name, rules string) string {
 	args := map[string]interface{}{
 		"Name":  name,
 		"Rules": rules,
@@ -4421,7 +4604,7 @@ func testAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T, extraHCL s
 			}
 			`,
 			enableACL: true,
-			policies:  ``, // No policy means no valid token
+			policies:  ``, // No policies means no valid token
 			wantNS:    nil,
 			wantErr:   "Permission denied",
 		},
@@ -5973,17 +6156,17 @@ func TestAgent_Monitor(t *testing.T) {
 			res := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(res, registerReq)
 			if http.StatusOK != res.Code {
-				t.Fatalf("expected 200 but got %v", res.Code)
+				r.Fatalf("expected 200 but got %v", res.Code)
 			}
 
 			// Wait until we have received some type of logging output
-			require.Eventually(t, func() bool {
+			require.Eventually(r, func() bool {
 				return len(resp.Body.Bytes()) > 0
 			}, 3*time.Second, 100*time.Millisecond)
 
 			cancelFunc()
 			code := <-codeCh
-			require.Equal(t, http.StatusOK, code)
+			require.Equal(r, http.StatusOK, code)
 			got := resp.Body.String()
 
 			// Only check a substring that we are highly confident in finding
@@ -6007,8 +6190,10 @@ func TestAgent_Monitor(t *testing.T) {
 			cancelCtx, cancelFunc := context.WithCancel(context.Background())
 			req = req.WithContext(cancelCtx)
 
+			a.enableDebug.Store(true)
+
 			resp := httptest.NewRecorder()
-			handler := a.srv.handler(true)
+			handler := a.srv.handler()
 			go handler.ServeHTTP(resp, req)
 
 			args := &structs.ServiceDefinition{
@@ -6023,11 +6208,11 @@ func TestAgent_Monitor(t *testing.T) {
 			res := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(res, registerReq)
 			if http.StatusOK != res.Code {
-				t.Fatalf("expected 200 but got %v", res.Code)
+				r.Fatalf("expected 200 but got %v", res.Code)
 			}
 
 			// Wait until we have received some type of logging output
-			require.Eventually(t, func() bool {
+			require.Eventually(r, func() bool {
 				return len(resp.Body.Bytes()) > 0
 			}, 3*time.Second, 100*time.Millisecond)
 			cancelFunc()
@@ -6060,24 +6245,24 @@ func TestAgent_Monitor(t *testing.T) {
 			res := httptest.NewRecorder()
 			a.srv.h.ServeHTTP(res, registerReq)
 			if http.StatusOK != res.Code {
-				t.Fatalf("expected 200 but got %v", res.Code)
+				r.Fatalf("expected 200 but got %v", res.Code)
 			}
 
 			// Wait until we have received some type of logging output
-			require.Eventually(t, func() bool {
+			require.Eventually(r, func() bool {
 				return len(resp.Body.Bytes()) > 0
 			}, 3*time.Second, 100*time.Millisecond)
 
 			cancelFunc()
 			code := <-codeCh
-			require.Equal(t, http.StatusOK, code)
+			require.Equal(r, http.StatusOK, code)
 
 			// Each line is output as a separate JSON object, we grab the first and
 			// make sure it can be unmarshalled.
 			firstLine := bytes.Split(resp.Body.Bytes(), []byte("\n"))[0]
 			var output map[string]interface{}
 			if err := json.Unmarshal(firstLine, &output); err != nil {
-				t.Fatalf("err: %v", err)
+				r.Fatalf("err: %v", err)
 			}
 		})
 	})
@@ -6669,7 +6854,7 @@ func TestAgentConnectCARoots_list(t *testing.T) {
 
 			dec := json.NewDecoder(resp.Body)
 			value := &structs.IndexedCARoots{}
-			require.NoError(t, dec.Decode(value))
+			require.NoError(r, dec.Decode(value))
 			if ca.ID != value.ActiveRootID {
 				r.Fatalf("%s != %s", ca.ID, value.ActiveRootID)
 			}
@@ -6911,14 +7096,27 @@ func TestAgentConnectCALeafCert_good(t *testing.T) {
 		require.Equal(t, issued, issued2)
 	}
 
+	replyCh := make(chan *httptest.ResponseRecorder, 1)
+
+	go func(index string) {
+		resp := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/agent/connect/ca/leaf/test?index="+index, nil)
+		a.srv.h.ServeHTTP(resp, req)
+
+		replyCh <- resp
+	}(index)
+
 	// Set a new CA
 	ca2 := connect.TestCAConfigSet(t, a, nil)
 
 	// Issue a blocking query to ensure that the cert gets updated appropriately
 	t.Run("test blocking queries update leaf cert", func(t *testing.T) {
-		resp := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/v1/agent/connect/ca/leaf/test?index="+index, nil)
-		a.srv.h.ServeHTTP(resp, req)
+		var resp *httptest.ResponseRecorder
+		select {
+		case resp = <-replyCh:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("blocking query did not wake up during rotation")
+		}
 		dec := json.NewDecoder(resp.Body)
 		issued2 := &structs.IssuedCert{}
 		require.NoError(t, dec.Decode(issued2))
@@ -7077,7 +7275,7 @@ func TestAgentConnectCALeafCert_goodNotLocal(t *testing.T) {
 
 			dec := json.NewDecoder(resp.Body)
 			issued2 := &structs.IssuedCert{}
-			require.NoError(t, dec.Decode(issued2))
+			require.NoError(r, dec.Decode(issued2))
 			if issued.CertPEM == issued2.CertPEM {
 				r.Fatalf("leaf has not updated")
 			}
@@ -7089,9 +7287,9 @@ func TestAgentConnectCALeafCert_goodNotLocal(t *testing.T) {
 			}
 
 			// Verify that the cert is signed by the new CA
-			requireLeafValidUnderCA(t, issued2, ca)
+			requireLeafValidUnderCA(r, issued2, ca)
 
-			require.NotEqual(t, issued, issued2)
+			require.NotEqual(r, issued, issued2)
 		})
 	}
 }
@@ -7468,11 +7666,11 @@ func TestAgentConnectCALeafCert_secondaryDC_good(t *testing.T) {
 		// Try and sign again (note no index/wait arg since cache should update in
 		// background even if we aren't actively blocking)
 		a2.srv.h.ServeHTTP(resp, req)
-		require.Equal(t, http.StatusOK, resp.Code)
+		require.Equal(r, http.StatusOK, resp.Code)
 
 		dec := json.NewDecoder(resp.Body)
 		issued2 := &structs.IssuedCert{}
-		require.NoError(t, dec.Decode(issued2))
+		require.NoError(r, dec.Decode(issued2))
 		if issued.CertPEM == issued2.CertPEM {
 			r.Fatalf("leaf has not updated")
 		}
@@ -7484,9 +7682,9 @@ func TestAgentConnectCALeafCert_secondaryDC_good(t *testing.T) {
 		}
 
 		// Verify that the cert is signed by the new CA
-		requireLeafValidUnderCA(t, issued2, dc1_ca2)
+		requireLeafValidUnderCA(r, issued2, dc1_ca2)
 
-		require.NotEqual(t, issued, issued2)
+		require.NotEqual(r, issued, issued2)
 	})
 }
 
@@ -7496,12 +7694,12 @@ func waitForActiveCARoot(t *testing.T, srv *HTTPHandlers, expect *structs.CARoot
 		resp := httptest.NewRecorder()
 		srv.h.ServeHTTP(resp, req)
 		if http.StatusOK != resp.Code {
-			t.Fatalf("expected 200 but got %v", resp.Code)
+			r.Fatalf("expected 200 but got %v", resp.Code)
 		}
 
 		dec := json.NewDecoder(resp.Body)
 		roots := &structs.IndexedCARoots{}
-		require.NoError(t, dec.Decode(roots))
+		require.NoError(r, dec.Decode(roots))
 
 		var root *structs.CARoot
 		for _, r := range roots.Roots {
@@ -7936,76 +8134,104 @@ func TestAgentConnectAuthorize_serviceWrite(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, resp.Code)
 }
 
-// Test when no intentions match w/ a default deny policy
-func TestAgentConnectAuthorize_defaultDeny(t *testing.T) {
+func TestAgentConnectAuthorize_DefaultIntentionPolicy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
 	t.Parallel()
 
-	a := NewTestAgent(t, TestACLConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	args := &structs.ConnectAuthorizeRequest{
-		Target:        "foo",
-		ClientCertURI: connect.TestSpiffeIDService(t, "web").URI().String(),
+	agentConfig := `primary_datacenter = "dc1"
+default_intention_policy = "%s"
+`
+	aclBlock := `acl {
+	enabled = true
+	default_policy = "%s"
+	tokens {
+		initial_management = "root"
+		agent = "root"
+		agent_recovery = "towel"
 	}
-	req, _ := http.NewRequest("POST", "/v1/agent/connect/authorize", jsonReader(args))
-	req.Header.Add("X-Consul-Token", "root")
-	resp := httptest.NewRecorder()
-	a.srv.h.ServeHTTP(resp, req)
-	assert.Equal(t, 200, resp.Code)
-
-	dec := json.NewDecoder(resp.Body)
-	obj := &connectAuthorizeResp{}
-	require.NoError(t, dec.Decode(obj))
-	assert.False(t, obj.Authorized)
-	assert.Contains(t, obj.Reason, "Default behavior")
 }
+`
 
-// Test when no intentions match w/ a default allow policy
-func TestAgentConnectAuthorize_defaultAllow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("too slow for testing.Short")
+	type testcase struct {
+		aclsEnabled  bool
+		defaultACL   string
+		defaultIxn   string
+		expectAuthz  bool
+		expectReason string
 	}
+	tcs := map[string]testcase{
+		"no ACLs, default intention allow": {
+			aclsEnabled:  false,
+			defaultIxn:   "allow",
+			expectAuthz:  true,
+			expectReason: "Default intention policy",
+		},
+		"no ACLs, default intention deny": {
+			aclsEnabled:  false,
+			defaultIxn:   "deny",
+			expectAuthz:  false,
+			expectReason: "Default intention policy",
+		},
+		"ACL deny, no intention policy": {
+			aclsEnabled:  true,
+			defaultACL:   "deny",
+			expectAuthz:  false,
+			expectReason: "Default behavior configured by ACLs",
+		},
+		"ACL allow, no intention policy": {
+			aclsEnabled:  true,
+			defaultACL:   "allow",
+			expectAuthz:  true,
+			expectReason: "Default behavior configured by ACLs",
+		},
+		"ACL deny, default intentions allow": {
+			aclsEnabled:  true,
+			defaultACL:   "deny",
+			defaultIxn:   "allow",
+			expectAuthz:  true,
+			expectReason: "Default intention policy",
+		},
+		"ACL allow, default intentions deny": {
+			aclsEnabled:  true,
+			defaultACL:   "allow",
+			defaultIxn:   "deny",
+			expectAuthz:  false,
+			expectReason: "Default intention policy",
+		},
+	}
+	for name, tc := range tcs {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	t.Parallel()
-
-	dc1 := "dc1"
-	a := NewTestAgent(t, `
-		primary_datacenter = "`+dc1+`"
-
-		acl {
-			enabled = true
-			default_policy = "allow"
-
-			tokens {
-				initial_management = "root"
-				agent = "root"
-				agent_recovery = "towel"
+			conf := fmt.Sprintf(agentConfig, tc.defaultIxn)
+			if tc.aclsEnabled {
+				conf += fmt.Sprintf(aclBlock, tc.defaultACL)
 			}
-		}
-	`)
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, dc1)
+			a := NewTestAgent(t, conf)
 
-	args := &structs.ConnectAuthorizeRequest{
-		Target:        "foo",
-		ClientCertURI: connect.TestSpiffeIDService(t, "web").URI().String(),
+			testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+			args := &structs.ConnectAuthorizeRequest{
+				Target:        "foo",
+				ClientCertURI: connect.TestSpiffeIDService(t, "web").URI().String(),
+			}
+			req, _ := http.NewRequest("POST", "/v1/agent/connect/authorize", jsonReader(args))
+			req.Header.Add("X-Consul-Token", "root")
+			resp := httptest.NewRecorder()
+			a.srv.h.ServeHTTP(resp, req)
+			assert.Equal(t, 200, resp.Code)
+
+			dec := json.NewDecoder(resp.Body)
+			obj := &connectAuthorizeResp{}
+			require.NoError(t, dec.Decode(obj))
+			assert.Equal(t, tc.expectAuthz, obj.Authorized)
+			assert.Contains(t, obj.Reason, tc.expectReason)
+		})
 	}
-	req, _ := http.NewRequest("POST", "/v1/agent/connect/authorize", jsonReader(args))
-	req.Header.Add("X-Consul-Token", "root")
-	resp := httptest.NewRecorder()
-	a.srv.h.ServeHTTP(resp, req)
-	assert.Equal(t, 200, resp.Code)
-
-	dec := json.NewDecoder(resp.Body)
-	obj := &connectAuthorizeResp{}
-	require.NoError(t, dec.Decode(obj))
-	assert.True(t, obj.Authorized)
-	assert.Contains(t, obj.Reason, "Default behavior")
 }
 
 func TestAgent_Host(t *testing.T) {
@@ -8081,6 +8307,32 @@ func TestAgent_HostBadACL(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.Code)
 }
 
+func TestAgent_Version(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	dc1 := "dc1"
+	a := NewTestAgent(t, `
+		primary_datacenter = "`+dc1+`"
+	`)
+	defer a.Shutdown()
+
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+	req, _ := http.NewRequest("GET", "/v1/agent/version", nil)
+	// req.Header.Add("X-Consul-Token", "initial-management")
+	resp := httptest.NewRecorder()
+	respRaw, err := a.srv.AgentVersion(resp, req)
+	assert.Nil(t, err)
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.NotNil(t, respRaw)
+
+	obj := respRaw.(*version.BuildInfo)
+	assert.NotNil(t, obj.HumanVersion)
+}
+
 // Thie tests that a proxy with an ExposeConfig is returned as expected.
 func TestAgent_Services_ExposeConfig(t *testing.T) {
 	if testing.Short() {
@@ -8130,4 +8382,60 @@ func TestAgent_Services_ExposeConfig(t *testing.T) {
 		actual.Proxy.Upstreams = make([]api.Upstream, 0)
 	}
 	require.Equal(t, srv1.Proxy.ToAPI(), actual.Proxy)
+}
+
+func TestAgent_Self_Reload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	// create new test agent
+	a := NewTestAgent(t, `
+		log_level = "info"
+		raft_snapshot_threshold = 100
+	`)
+	defer a.Shutdown()
+
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+	req, _ := http.NewRequest("GET", "/v1/agent/self", nil)
+	resp := httptest.NewRecorder()
+	a.srv.h.ServeHTTP(resp, req)
+
+	dec := json.NewDecoder(resp.Body)
+	val := &Self{}
+	require.NoError(t, dec.Decode(val))
+
+	require.Equal(t, "info", val.DebugConfig["Logging"].(map[string]interface{})["LogLevel"])
+	require.Equal(t, float64(100), val.DebugConfig["RaftSnapshotThreshold"].(float64))
+
+	// reload with new config
+	shim := &delegateConfigReloadShim{delegate: a.delegate}
+	a.delegate = shim
+	newCfg := TestConfig(testutil.Logger(t), config.FileSource{
+		Name:   "Reload",
+		Format: "hcl",
+		Data: `
+			data_dir = "` + a.Config.DataDir + `"
+			log_level = "debug"
+			raft_snapshot_threshold = 200	
+		`,
+	})
+	if err := a.reloadConfigInternal(newCfg); err != nil {
+		t.Fatalf("got error %v want nil", err)
+	}
+	require.Equal(t, 200, shim.newCfg.RaftSnapshotThreshold)
+
+	// validate new config is reflected in API response
+	req, _ = http.NewRequest("GET", "/v1/agent/self", nil)
+	resp = httptest.NewRecorder()
+	a.srv.h.ServeHTTP(resp, req)
+
+	dec = json.NewDecoder(resp.Body)
+	val = &Self{}
+	require.NoError(t, dec.Decode(val))
+	require.Equal(t, "debug", val.DebugConfig["Logging"].(map[string]interface{})["LogLevel"])
+	require.Equal(t, float64(200), val.DebugConfig["RaftSnapshotThreshold"].(float64))
+
 }

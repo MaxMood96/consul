@@ -1,29 +1,30 @@
 # Copyright (c) HashiCorp, Inc.
 # SPDX-License-Identifier: MPL-2.0
 
-name: Nightly Test Main
+name: Nightly Frontend Test Main
 on:
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch: {}
 
 env:
-  EMBER_PARTITION_TOTAL: 4      # Has to be changed in tandem with the matrix.partition
+  EMBER_PARTITION_TOTAL: 4        # Has to be changed in tandem with the matrix.partition
   BRANCH: "main"
-  BRANCH_NAME: "main"           # Used for naming artifacts
+  BRANCH_NAME: "main"             # Used for naming artifacts
+  GOPRIVATE: github.com/hashicorp # Required for enterprise deps
 
 jobs:
   frontend-test-workspace-node:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -42,20 +43,20 @@ jobs:
         working-directory: ./ui/packages/consul-ui
         run: make test-node
 
-  frontend-build-oss:
+  frontend-build-ce:
     runs-on: ubuntu-latest
     env:
       JOBS: 2
       CONSUL_NSPACES_ENABLED: 0
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -64,37 +65,37 @@ jobs:
         working-directory: ./ui
         run: make deps
 
-      - name: Ember Build OSS
-        id: build-oss
+      - name: Ember Build CE
+        id: build-ce
         working-directory: ./ui/packages/consul-ui
         run: make build-ci
 
-      - name: Upload OSS Frontend
-        uses: actions/upload-artifact@v3
+      - name: Upload CE Frontend
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
-          name: frontend-oss-${{ env.BRANCH_NAME }}
+          name: frontend-ce-${{ env.BRANCH_NAME }}
           path: ./ui/packages/consul-ui/dist
           if-no-files-found: error
 
-  frontend-test-oss:
+  frontend-test-ce:
     runs-on: ubuntu-latest
-    needs: [frontend-build-oss]
+    needs: [frontend-build-ce]
     strategy:
       matrix:
         partition: [ 1, 2, 3, 4 ]
     env:
       CONSUL_NSPACES_ENABLED: 0
-      EMBER_TEST_REPORT: test-results/report-oss.xml #outputs test report for CircleCI test summary
+      EMBER_TEST_REPORT: test-results/report-ce.xml #outputs test report for CI test summary
       EMBER_TEST_PARALLEL: true #enables test parallelization with ember-exam
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -103,13 +104,13 @@ jobs:
         working-directory: ./ui
         run: make deps
 
-      - name: Download OSS Frontend
-        uses: actions/download-artifact@v3
+      - name: Download CE Frontend
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
         with:
-          name: frontend-oss-${{ env.BRANCH_NAME }}
+          name: frontend-ce-${{ env.BRANCH_NAME }}
           path: ./ui/packages/consul-ui/dist
 
-      - name: Ember Test OSS
+      - name: Ember Test CE
         id: cache
         working-directory: ./ui/packages/consul-ui
         run: node_modules/.bin/ember exam --split=$EMBER_PARTITION_TOTAL --partition=${{ matrix.partition }} --path dist --silent -r xunit
@@ -120,14 +121,14 @@ jobs:
       JOBS: 2
       CONSUL_NSPACES_ENABLED: 1
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -137,12 +138,12 @@ jobs:
         run: make deps
 
       - name: Ember Build ENT
-        id: build-oss
+        id: build-ce
         working-directory: ./ui/packages/consul-ui
         run: make build-ci
 
       - name: Upload ENT Frontend
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: frontend-ent-${{ env.BRANCH_NAME }}
           path: ./ui/packages/consul-ui/dist
@@ -156,17 +157,17 @@ jobs:
         partition: [ 1, 2, 3, 4 ]
     env:
       CONSUL_NSPACES_ENABLED: 1
-      EMBER_TEST_REPORT: test-results/report-oss.xml #outputs test report for CircleCI test summary
+      EMBER_TEST_REPORT: test-results/report-ce.xml #outputs test report for CI test summary
       EMBER_TEST_PARALLEL: true #enables test parallelization with ember-exam
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -176,7 +177,7 @@ jobs:
         run: make deps
 
       - name: Download ENT Frontend
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
         with:
           name: frontend-ent-${{ env.BRANCH_NAME }}
           path: ./ui/packages/consul-ui/dist
@@ -190,14 +191,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [frontend-build-ent]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           ref: ${{ env.BRANCH }}
 
       # Not necessary to use yarn, but enables caching
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
-          node-version: 14
+          node-version: 18
           cache: 'yarn'
           cache-dependency-path: ./ui/yarn.lock
 
@@ -207,7 +208,7 @@ jobs:
         run: make deps
 
       - name: Download ENT Frontend
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
         with:
           name: frontend-ent-${{ env.BRANCH_NAME }}
           path: ./ui/packages/consul-ui/dist
@@ -218,12 +219,12 @@ jobs:
 
   slack-failure-notification:
     runs-on: ubuntu-latest
-    needs: [frontend-test-oss, frontend-test-ent]
+    needs: [frontend-test-ce, frontend-test-ent]
     if: ${{ failure() }}
     steps:
       - name: Slack Notification
         id: slack
-        uses: slackapi/slack-github-action@v1.19
+        uses: slackapi/slack-github-action@70cd7be8e40a46e8b0eced40b0de447bdb42f68e # v1.26.0
         with:
           payload: |
             {

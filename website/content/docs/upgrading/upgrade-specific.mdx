@@ -14,31 +14,128 @@ provided for their upgrades as a result of new features or changed behavior.
 This page is used to document those details separately from the standard
 upgrade flow.
 
+## Consul 1.20.x
+
+### Mesh traffic request path normalization enabled by default
+
+As of Consul v1.20.1, inbound traffic to mesh proxies will have Envoy request [path normalization](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto#envoy-v3-api-field-extensions-filters-network-http-connection-manager-v3-httpconnectionmanager-normalize-path) applied by default. This should not interfere with the majority of service traffic, but can be disabled if needed by setting `http.incoming.request_normalization.insecure_disable_path_normalization` to `true` in the [global `mesh` configuration entry](/consul/docs/connect/config-entries/mesh#request-normalization). This setting is generally safe to change if not using L7 intentions with path matching.
+
+## Consul v1.19.x
+
+### Health endpoint status filtering is now processed on the server side when using client agents
+In previous versions of Consul, client agents responded to health queries by requesting all results from the Consul servers and then locally filtering out service nodes with a `critical` status. The client agent also processed the `?passing` parameter by filtering node results locally. This process was not resource efficient in large deployments because large numbers of services and health check results must propagate to many clients before Consul can return a healthy node.
+
+In this release, the Consul server is responsible for filtering services according to their health status before it sends the data to a client agent. When upgrading the version of Consul your deployment runs to this release, you must upgrade the Consul servers before you upgrade the client agents. We recommend this upgrade order to avoid a scenario where Consul returns results for an unhealthy service because the client agent no longer filters nodes but the servers do not yet understand the `?passing` query argument.
+
+### Metrics removal
+
+In previous versions, Consul emitted redundant state store usage metrics that contained two instances of `consul` in the metric name. As an example, config entry usage counts were emitted as both:
+
+- `consul.state.config_entries`
+- `consul.consul.state.config_entries`
+
+As of Consul v1.19, Consul does not emit the redundant metric with the double `consul.consul` in its name. Any monitoring alerts and dashboards that you may have utilizing these metrics may require edits to update to the simplified metric name.
+
+### Legacy API Gateway Removal
+The Consul Kubernetes Helm chart stanza
+[`.apiGateway`](/consul/docs/v1.16.x/k8s/helm#apigateway-1)
+is removed in Consul v1.19.0. If using that stanza, migrate to the
+[`connectInject.apiGateway`](/consul/docs/k8s/helm#v-connectinject-apigateway)
+stanza before upgrading to Consul v1.19 or later.
+
+The `.apiGateway` stanza is associated with the legacy API gateway that was
+[deprecated in Consul v1.16.0](https://developer.hashicorp.com/consul/docs/release-notes/consul/v1_16_x#what-s-deprecated).
+The Kubernetes-only legacy API gateway is superseded by the modern, multi-runtime
+[API gateway](/consul/docs/connect/config-entries/api-gateway).
+On Kubernetes, the modern API gateway is associated with the `connectInject.apiGateway` stanza.
+
+### Mesh traffic request path normalization enabled by default
+
+As of Consul v1.19.3, inbound traffic to mesh proxies will have Envoy request [path normalization](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto#envoy-v3-api-field-extensions-filters-network-http-connection-manager-v3-httpconnectionmanager-normalize-path) applied by default. This should not interfere with the majority of service traffic, but can be disabled if needed by setting `http.incoming.request_normalization.insecure_disable_path_normalization` to `true` in the [global `mesh` configuration entry](/consul/docs/connect/config-entries/mesh#request-normalization). This setting is generally safe to change if not using L7 intentions with path matching.
+
+## Consul 1.18.x
+
+### Mesh traffic request path normalization enabled by default
+
+As of Consul v1.18.5, inbound traffic to mesh proxies will have Envoy request [path normalization](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto#envoy-v3-api-field-extensions-filters-network-http-connection-manager-v3-httpconnectionmanager-normalize-path) applied by default. This should not interfere with the majority of service traffic, but can be disabled if needed by setting `http.incoming.request_normalization.insecure_disable_path_normalization` to `true` in the [global `mesh` configuration entry](/consul/docs/connect/config-entries/mesh#request-normalization). This setting is generally safe to change if not using L7 intentions with path matching.
+
+## Consul 1.17.x
+
+### Known issues
+
+Consul versions 1.17.2 and 1.16.5 perform excessively strict TLS SAN verification on terminating gateways, which prevents connections outside of the mesh to upstream services. Terminating gateway users are advised to avoid deploying these Consul versions. A fix will be present in a future release of Consul 1.17.3 and 1.16.6 [[GH-20360](https://github.com/hashicorp/consul/issues/20360)].
+
+#### Audit Log naming changes (Enterprise)
+Prior to Consul 1.17.0, audit logs contained timestamps on both the original log file names as well as rotated log file names.
+After Consul 1.17.0, only timestamps will be included in rotated log file names.
+
+#### Service-defaults upstream config (Enterprise)
+Prior to Consul v1.17.0, [Kubernetes annotations for upstream services](/consul/docs/k8s/annotations-and-labels#consul-hashicorp-com-connect-service-upstreams)
+that did not explicitly specify a namespace or partition incorrectly used service-defaults configurations, such as [default protocol](https://developer.hashicorp.com/consul/docs/connect/config-entries/service-defaults#set-the-default-protocol), from the default partition and namespace instead of the local partition and namespace.
+
+This bug is fixed starting in Consul v1.17.0. Now service-defaults configurations from the local partition and namespace are fetched when not specified in annotations.
+If you are using non-default partitions and namespaces with Consul-k8s, we recommend explicitly defining these fields for all upstreams in addition to ensuring that accurate
+service-defaults are configured in each partition and namespace before upgrading. Doing so ensures that no unexpected protocol changes occur during the upgrade.
+
+#### ACL tokens with templated policies
+[ACL templated policies](/consul/docs/security/acl#templated-policies) were added to 1.17.0 to simplify obtaining the right permissions for ACL tokens. When performing a [rolling upgrade](/consul/tutorials/datacenter-operations/upgrade-federated-environment#server-rolling-upgrade) and a version of Consul prior to 1.17.x is presented with a token created Consul v1.17.x or newer that contains templated policies, the templated policies field is not recognized. As a result, the token might not have the expected permissions on the older version of Consul.
+
 ## Consul 1.16.x
+
+### Known issues
+
+Consul versions 1.17.2 and 1.16.5 perform excessively strict TLS SAN verification on terminating gateways, which prevents connections outside of the mesh to upstream services. Terminating gateway users are advised to avoid deploying these Consul versions. A fix will be present in a future release of Consul 1.17.3 and 1.16.6 [[GH-20360](https://github.com/hashicorp/consul/issues/20360)].
+
+Service mesh in Consul versions 1.16.0 and 1.16.1 may have issues when a snapshot restore is performed and the servers are hosting xDS streams.
+When this bug triggers, it causes Envoy to incorrectly populate upstream endpoints. To prevent this issue, service mesh users who run agent-less workloads should upgrade Consul to v1.16.2 or later.
+
+#### Vault Enterprise as CA ((#vault-enterprise-as-ca-1-16))
+Using Vault as CA with Consul version 1.16.2 will fail to initialize the CA if [`namespace`](/consul/docs/connect/ca/vault#namespace) is set
+but [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) or [`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace)
+are empty. This is a bug which will be fixed in a future version.
+
+To work around this issue, users must explicitly set [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) and
+[`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace) to the same value as [`namespace`](/consul/docs/connect/ca/vault#namespace).
+Set your configuration by calling [set-config](/consul/commands/connect/ca#set-config) then use [get-config](/consul/commands/connect/ca#get-config) to check.
+
+#### API health endpoints return different status code
+
+Consul versions 1.16.0+ now return an error 403 "Permission denied" status
+whenever the `/v1/health/connect/` and `/v1/health/ingress/` endpoints are
+queried with insufficient ACL `service:read` privileges.
+
+In Consul versions older than 1.16.0, the service health API did not return an explicit error when given a token with invalid permissions. Instead, it returned an empty list with a success status code.
+
+Before upgrading, ensure that all of your applications can handle this new API behavior properly. An update is not required unless you have a custom application that is querying one of these API endpoints directly.
 
 #### Remove deprecated service-defaults peer upstream override behavior
 
-When configuring a service defaults configuration entry, the [`UpstreamConfig.Overrides` configuration](/consul/docs/connect/config-entries/service-defaults#upstreamconfig-overrides) 
+When configuring a service defaults configuration entry, the [`UpstreamConfig.Overrides` configuration](/consul/docs/connect/config-entries/service-defaults#upstreamconfig-overrides)
 does not apply to peer upstreams unless the [`Peer`](/consul/docs/connect/config-entries/service-defaults#upstreamconfig-overrides-peer) field is explicitly provided.
 This change removes the backward-compatibility behavior introduced in Consul 1.15.x. Refer to the [upgrade instructions for 1.15.x](#service-defaults-overrides-for-upstream-peered-services) for more information.
 
 ## Consul 1.15.x
 
-#### Service mesh known issue
+### Service mesh compatibility ((#service-mesh-compatibility-1-15))
 
-To err on the side of caution,
-service mesh deployments should not upgrade to Consul v1.15 at this time.
+Upgrade to **Consul version 1.15.2 or later**.
+If using [Vault Enterprise as CA](#vault-enterprise-as-ca-1-15), **avoid Consul version 1.15.6**.
 
-We are currently investigating a not-consistently-reproducible issue that can cause
+Consul versions 1.15.0 - 1.15.1 contain a race condition that can cause
 some service instances to lose their ability to communicate in the mesh after
 [72 hours (LeafCertTTL)](/consul/docs/connect/ca/consul#leafcertttl)
 due to a problem with leaf certificate rotation.
-We will update this section with more information as our investigation continues,
-including the target availability for a fix.
 
-If you are already operating Consul v1.15, refer to discussion of this issue on
-[GH-16779](https://github.com/hashicorp/consul/issues/16779)
-for potential workarounds and to share your observations.
+This bug is fixed in Consul versions 1.15.2 and newer.
+
+#### Vault Enterprise as CA ((#vault-enterprise-as-ca-1-15))
+Using Vault as CA with Consul version 1.15.6 will fail to initialize the CA if [`namespace`](/consul/docs/connect/ca/vault#namespace) is set
+but [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) or [`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace)
+are empty. This is a bug which will be fixed in a future version.
+
+To work around this issue, users must explicitly set [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) and
+[`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace) to the same value as [`namespace`](/consul/docs/connect/ca/vault#namespace).
+Set your configuration by calling [set-config](/consul/commands/connect/ca#set-config) then use [get-config](/consul/commands/connect/ca#get-config) to check.
 
 #### Removing configuration options
 
@@ -46,13 +143,13 @@ The `connect.enable_serverless_plugin` configuration option was removed. Lambda 
 
 #### Deprecating authentication via token query parameter
 
-Providing a Consul ACL token in API requests using the `token` query parameter is deprecated and will be removed in Consul 1.17.
+Providing a Consul ACL token in API requests using the `token` query parameter is deprecated and will be removed in a future Consul version.
 Instead, you should provide the token through the `X-Consul-Token` header or with the Bearer scheme in the authorization header as described in the [API authentication documentation](/consul/api-docs/api-structure#authentication).
 
 Check whether you are using a `token` query parameter by searching your Consul agent logs for the message:
 
 ```shell-session hideClipboard
-$ This request used the token query parameter which is deprecated and will be removed in Consul 1.17
+$ This request used the token query parameter which is deprecated and will be removed in a future Consul version
 ```
 
 Deprecated authentication using the `token` query parameter:
@@ -147,7 +244,7 @@ In Consul v1.15 and higher:
    UpstreamConfig = {
      Overrides = [
        {
-          Name = foo  # Applies to local service `foo` 
+          Name = foo  # Applies to local service `foo`
        },
        {
           Name = foo  # Applies to `foo` imported from peered cluster `bar`
@@ -159,16 +256,20 @@ In Consul v1.15 and higher:
 
    </CodeBlockConfig>
 
+### Mesh traffic request path normalization enabled by default
+
+As of Consul v1.15.15, inbound traffic to mesh proxies will have Envoy request [path normalization](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto#envoy-v3-api-field-extensions-filters-network-http-connection-manager-v3-httpconnectionmanager-normalize-path) applied by default. This should not interfere with the majority of service traffic, but can be disabled if needed by setting `http.incoming.request_normalization.insecure_disable_path_normalization` to `true` in the [global `mesh` configuration entry](/consul/docs/connect/config-entries/mesh#request-normalization). This setting is generally safe to change if not using L7 intentions with path matching.
+
 ## Consul 1.14.x
 
 ### Service Mesh Compatibility
-Prior to Consul 1.14, cluster peering or Consul connect were disabled by default.
+Prior to Consul 1.14, cluster peering and Consul service mesh were disabled by default.
 A breaking change was made in Consul 1.14 that:
 - [Cluster Peering is enabled by default.](/consul/docs/connect/cluster-peering)
   Cluster peering and WAN federation can coexist,
   so there is no need to disable cluster peering to upgrade existing WAN federated datacenters.
   To disable cluster peering nonetheless, set [`peering.enabled`](/consul/docs/agent/config/config-files#peering_enabled) to `false`.
-- [Consul Connect is enabled by default.](/consul/docs/connect)
+- [Consul service mesh is enabled by default.](/consul/docs/connect)
   To disable, set [`connect.enabled`](/consul/docs/agent/config/config-files#connect_enabled) to `false`.
 
 The changes to Consul service mesh in version 1.14 are incompatible with Nomad 1.4.3 and
@@ -181,6 +282,14 @@ to use TLS for contacting the HTTP API, it will also incorrectly enable TLS for 
 Users should not upgrade to 1.14.0 if they are using plaintext gRPC connections in
 conjunction with TLS-encrypted HTTP APIs.
 
+#### Vault Enterprise as CA ((#vault-enterprise-as-ca-1-14))
+Using Vault as CA with Consul version 1.14.10 will fail to initialize the CA if [`namespace`](/consul/docs/connect/ca/vault#namespace) is set
+but [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) or [`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace)
+are empty. This is a bug which will be fixed in a future version.
+
+To work around this issue, users must explicitly set [`intermediate_pki_namespace`](/consul/docs/connect/ca/vault#intermediatepkinamespace) and
+[`root_pki_namespace`](/consul/docs/connect/ca/vault#rootpkinamespace) to the same value as [`namespace`](/consul/docs/connect/ca/vault#namespace).
+Set your configuration by calling [set-config](/consul/commands/connect/ca#set-config) then use [get-config](/consul/commands/connect/ca#get-config) to check.
 
 #### Changes to gRPC TLS configuration
 
@@ -211,7 +320,7 @@ If you already use gRPC encryption, change the following fields to ensure compat
 [Cluster peering](/consul/docs/connect/cluster-peering) was released in Consul 1.13 as an experimental feature.
 In Consul 1.14, cluster peering has been improved and is now considered stable. All experimental peering
 connections created by 1.13 should be
-[deleted](/consul/docs/connect/cluster-peering/create-manage-peering#delete-peering-connections)
+[deleted](/consul/docs/connect/cluster-peering/usage/manage-connections#delete-peering-connections)
 prior to upgrading, as they will no longer be compatible with 1.14.
 
 ## Consul 1.13.x
@@ -233,7 +342,7 @@ Consul 1.13.0 contains a bug that prevents Consul server agents from restoring
 saved state on startup if the state
 
 1. was generated before Consul 1.13 (such as during an upgrade), and
-2. contained any Connect proxy registrations.
+2. contained any service mesh proxy registrations.
 
 This bug is fixed in Consul versions 1.13.1 and newer.
 
@@ -396,6 +505,12 @@ A breaking change was made in Consul 1.13.2 that impacts service mesh operation
 if the Vault policy is not modified as described.
 As a precaution, we recommend both modifying the Vault policy and upgrading
 to Consul 1.13.3 or later to avoid the breaking nature of that change.
+
+### Nomad Incompatibility
+
+Nomad users should not upgrade to Consul v1.13.8. An API change in this Consul
+release prevents Nomad from correctly detecting the Consul agent version. As a
+result, allocations are not placed in clients running v1.13.8.
 
 ## Consul 1.12.x ((#consul-1-12-0))
 
@@ -735,11 +850,11 @@ fields which are those documented in the example payloads in the API documentati
 
 ### DNS PTR Record Output
 
-Consul will now return the canonical service name in response to PTR queries. For OSS users the
+Consul will now return the canonical service name in response to PTR queries. For CE users, the
 change is that the datacenter will be present where it was not before. For Consul Enterprise
 users, both the datacenter and the services namespace will be present. For example, where a
 PTR record would previously have contained `web.service.consul`, it will now be `web.service.dc1.consul`
-in OSS or `web.service.ns1.dc1.consul` for Enterprise.
+in CE, or `web.service.ns1.dc1.consul` for Enterprise.
 
 ### Telemetry: semantics of `consul.rpc.query` changed, see `consul.rpc.queries_blocking`
 
@@ -766,16 +881,16 @@ Starting with Consul 1.7.1 this is the new default.
 
 #### Removal of Deprecated Features
 
-Managed proxies (which have been [deprecated](/consul/docs/connect/proxies/managed-deprecated)
-since Consul 1.3.0) have now been [removed](/consul/docs/connect/proxies). Before
-upgrading, you will need to migrate any managed proxy usage to [sidecar service
-registrations](/consul/docs/connect/registration/sidecar-service).
+Managed proxies, which are deprecated since Consul v1.3.0, have now been
+[removed](/consul/docs/connect/proxies). Before upgrading, you must
+migrate any managed proxy usage to [sidecar service
+registrations](/consul/docs/connect/proxies/deploy-sidecar-services).
 
 ## Consul 1.4.0
 
 There are two major features in Consul 1.4.0 that may impact upgrades: a [new
 ACL system](#acl-upgrade) and [multi-datacenter support for
-Connect](#connect-multi-datacenter) in the Enterprise version.
+service mesh](#multi-datacenter-service-mesh) in the Enterprise version.
 
 ### ACL Upgrade
 
@@ -853,16 +968,16 @@ API so existing integrations that create tokens (e.g. Vault) will continue to
 work. The "legacy" tokens generated though will not be able to take advantage of
 new policy features. It's recommended that you complete migration of all tokens
 as soon as possible after upgrade, as well as updating any integrations to work
-with the the new ACL [Token](/consul/api-docs/acl/tokens) and
+with the new ACL [Token](/consul/api-docs/acl/tokens) and
 [Policy](/consul/api-docs/acl/policies) APIs.
 
-### Connect Multi-datacenter
+### Multi-datacenter service mesh
 
 This only applies to users upgrading from an older version of Consul Enterprise to Consul Enterprise 1.4.0 (all license types).
 
-In addition, this upgrade will only affect clusters where [Connect is enabled](/consul/docs/connect/configuration) on your servers before the migration.
+In addition, this upgrade will only affect clusters where [service mesh is enabled](/consul/docs/connect/configuration) on your servers before the migration.
 
-Connect multi-datacenter uses the same primary/secondary approach as ACLs and
+Multi-datacenter service mesh uses the same primary/secondary approach as ACLs and
 will use the same [primary_datacenter](#primary-datacenter). When a secondary
 datacenter server restarts with 1.4.0 it will detect it is not the primary and
 begin an automatic bootstrap of multi-datacenter CA federation.
@@ -871,11 +986,11 @@ Datacenters can be upgraded in either order; secondary datacenters will not
 switch into multi-datacenter mode until all servers in both the secondary and
 primary datacenter are detected to be running at least Consul 1.4.0. Secondary
 datacenters monitor this periodically (every few minutes) and will
-automatically upgrade Connect to use a federated Certificate Authority when
+automatically upgrade service mesh to use a federated Certificate Authority when
 they do.
 
-In general, migrating a Consul cluster from OSS to Enterprise will update the
-CA to be federated automatically and without impact on Connect traffic. When
+In general, migrating a Consul cluster from CE to Enterprise will update the
+CA to be federated automatically and without impact on service mesh traffic. When
 upgrading Consul Enterprise 1.3.x to Consul Enterprise 1.4.0 upgrades the CA
 upgrade is seamless, however depending on the size of the cluster, _new_
 connection attempts in the secondary datacenter might fail for a short window
@@ -884,14 +999,11 @@ authorization endpoint validating originating cluster in a way that was not
 fully forwards compatible with migrating between cluster trust domains. That
 issue is fixed in 1.4.0 as part of General Availability.
 
-Once migrated (typically a few seconds). Connect will use the primary
+Once migrated (typically a few seconds). The service mesh will use the primary
 datacenter's Certificate Authority as the root of trust for all other
 datacenters. CA migration or root key changes in the primary will now rotate
 automatically and without loss of connectivity throughout all datacenters and
 workloads.
-
-For more information see [Connect
-Multi-datacenter](/consul/docs/enterprise).
 
 ## Consul 1.3.0
 
@@ -1416,7 +1528,7 @@ the file. Consul 0.7 also uses a new, automatically-created raft/peers.info file
 to avoid ingesting the `peers.json` file on the first start after upgrading (the
 `peers.json` file is simply deleted on the first start after upgrading).
 
-Please be sure to review the [Outage Recovery tutorial](/consul/tutorials/datacenter-operations/recovery-outage)
+Please be sure to review the [Disaster recovery for Consul clusters tutorial](/consul/tutorials/datacenter-operations/recovery-outage)
 before upgrading for more details.
 
 ## Consul 0.6.4

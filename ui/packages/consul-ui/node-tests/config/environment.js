@@ -1,6 +1,6 @@
 /**
  * Copyright (c) HashiCorp, Inc.
- * SPDX-License-Identifier: MPL-2.0
+ * SPDX-License-Identifier: BUSL-1.1
  */
 
 /* eslint-env node */
@@ -31,6 +31,7 @@ test('config has the correct environment settings', function (t) {
         LocalDatacenter: 'dc1',
         PrimaryDatacenter: 'dc1',
         APIPrefix: '',
+        V2CatalogEnabled: false,
       },
     },
     {
@@ -49,6 +50,7 @@ test('config has the correct environment settings', function (t) {
         LocalDatacenter: 'dc1',
         PrimaryDatacenter: 'dc1',
         APIPrefix: '',
+        V2CatalogEnabled: false,
       },
     },
     {
@@ -67,6 +69,7 @@ test('config has the correct environment settings', function (t) {
         LocalDatacenter: 'dc1',
         PrimaryDatacenter: 'dc1',
         APIPrefix: '',
+        V2CatalogEnabled: false,
       },
     },
     {
@@ -82,6 +85,7 @@ test('config has the correct environment settings', function (t) {
         LocalDatacenter: 'dc1',
         PrimaryDatacenter: 'dc1',
         APIPrefix: '',
+        V2CatalogEnabled: false,
       },
     },
   ].forEach(function (item) {

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package dns
 
@@ -33,7 +33,7 @@ func helloServer(w dns.ResponseWriter, req *dns.Msg) {
 	w.WriteMsg(m)
 }
 
-func testClient(t *testing.T, server *Server) pbdns.DNSServiceClient {
+func testClient(t *testing.T, server testutils.GRPCService) pbdns.DNSServiceClient {
 	t.Helper()
 
 	addr := testutils.RunTestServer(t, server)

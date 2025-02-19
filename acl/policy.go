@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package acl
 
@@ -75,6 +75,11 @@ type PolicyRules struct {
 	Operator              string               `hcl:"operator"`
 	Mesh                  string               `hcl:"mesh"`
 	Peering               string               `hcl:"peering"`
+
+	// Deprecated: exists just to track the former field for decoding
+	Identities []*IdentityRule `hcl:"identity,expand"`
+	// Deprecated: exists just to track the former field for decoding
+	IdentityPrefixes []*IdentityRule `hcl:"identity_prefix,expand"`
 }
 
 // Policy is used to represent the policy specified by an ACL configuration.
@@ -88,6 +93,21 @@ type Policy struct {
 type AgentRule struct {
 	Node   string `hcl:",key"`
 	Policy string
+}
+
+// IdentityRule represents a policy for a workload identity
+//
+// Deprecated: exists just to track the former field for decoding
+type IdentityRule struct {
+	Name   string `hcl:",key"`
+	Policy string
+
+	// Intentions is the policy for intentions where this workload identity
+	// is the destination. This may be empty, in which case the Policy determines
+	// the intentions policy.
+	Intentions string
+
+	EnterpriseRule `hcl:",squash"`
 }
 
 // KeyRule represents a rule for a key
@@ -167,6 +187,10 @@ func (pr *PolicyRules) Validate(conf *Config) error {
 			return fmt.Errorf("Invalid agent_prefix policy: %#v", ap)
 		}
 	}
+
+	// Identity rules are deprecated, zero them out.
+	pr.Identities = nil
+	pr.IdentityPrefixes = nil
 
 	// Validate the key policy
 	for _, kp := range pr.Keys {
@@ -286,8 +310,8 @@ func (pr *PolicyRules) Validate(conf *Config) error {
 	return nil
 }
 
-func parse(rules string, conf *Config, meta *EnterprisePolicyMeta) (*Policy, error) {
-	p, err := decodeRules(rules, conf, meta)
+func parse(rules string, warnOnDuplicateKey bool, conf *Config, meta *EnterprisePolicyMeta) (*Policy, error) {
+	p, err := decodeRules(rules, warnOnDuplicateKey, conf, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +338,11 @@ func NewPolicyFromSource(rules string, conf *Config, meta *EnterprisePolicyMeta)
 
 	var policy *Policy
 	var err error
-	policy, err = parse(rules, conf, meta)
+	warnOnDuplicateKey := false
+	if conf != nil {
+		warnOnDuplicateKey = conf.WarnOnDuplicateKey
+	}
+	policy, err = parse(rules, warnOnDuplicateKey, conf, meta)
 	return policy, err
 }
 

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package inmem
 
@@ -141,7 +141,13 @@ func (s *Store) WriteCAS(res *pbresource.Resource, vsn string) error {
 	}
 	tx.Commit()
 
-	s.publishEvent(idx, pbresource.WatchEvent_OPERATION_UPSERT, res)
+	s.publishEvent(idx, &pbresource.WatchEvent{
+		Event: &pbresource.WatchEvent_Upsert_{
+			Upsert: &pbresource.WatchEvent_Upsert{
+				Resource: res,
+			},
+		},
+	})
 
 	return nil
 }
@@ -188,7 +194,13 @@ func (s *Store) DeleteCAS(id *pbresource.ID, vsn string) error {
 	}
 	tx.Commit()
 
-	s.publishEvent(idx, pbresource.WatchEvent_OPERATION_DELETE, res)
+	s.publishEvent(idx, &pbresource.WatchEvent{
+		Event: &pbresource.WatchEvent_Delete_{
+			Delete: &pbresource.WatchEvent_Delete{
+				Resource: res,
+			},
+		},
+	})
 
 	return nil
 }
@@ -234,8 +246,8 @@ func (s *Store) WatchList(typ storage.UnversionedType, ten *pbresource.Tenancy, 
 	// relevant resources only, which is far more efficient.
 	var sub stream.Subject
 	if ten.Partition == storage.Wildcard ||
-		ten.PeerName == storage.Wildcard ||
 		ten.Namespace == storage.Wildcard {
+		// TODO(peering/v2) update conditional to handle peer tenancy wildcards
 		sub = wildcardSubject{typ}
 	} else {
 		sub = tenancySubject{typ, ten}
@@ -259,11 +271,10 @@ func (s *Store) WatchList(typ storage.UnversionedType, ten *pbresource.Tenancy, 
 	}, nil
 }
 
-// OwnerReferences returns the IDs of resources owned by the resource with the
-// given ID.
+// ListByOwner returns resources owned by the resource with the given ID.
 //
 // For more information, see the storage.Backend documentation.
-func (s *Store) OwnerReferences(id *pbresource.ID) ([]*pbresource.ID, error) {
+func (s *Store) ListByOwner(id *pbresource.ID) ([]*pbresource.Resource, error) {
 	tx := s.txn(false)
 	defer tx.Abort()
 
@@ -272,11 +283,11 @@ func (s *Store) OwnerReferences(id *pbresource.ID) ([]*pbresource.ID, error) {
 		return nil, err
 	}
 
-	var refs []*pbresource.ID
+	var res []*pbresource.Resource
 	for v := iter.Next(); v != nil; v = iter.Next() {
-		refs = append(refs, v.(*pbresource.Resource).Id)
+		res = append(res, v.(*pbresource.Resource))
 	}
-	return refs, nil
+	return res, nil
 }
 
 func (s *Store) txn(write bool) *memdb.Txn {

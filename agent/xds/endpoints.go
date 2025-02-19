@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package xds
 
@@ -8,17 +8,20 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/hashicorp/go-hclog"
+
 	envoy_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 	"github.com/hashicorp/go-bexpr"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/agent/xds/response"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 )
 
 const (
@@ -41,13 +44,7 @@ func (s *ResourceGenerator) endpointsFromSnapshot(cfgSnap *proxycfg.ConfigSnapsh
 	case structs.ServiceKindIngressGateway:
 		return s.endpointsFromSnapshotIngressGateway(cfgSnap)
 	case structs.ServiceKindAPIGateway:
-		// TODO Find a cleaner solution, can't currently pass unexported property types
-		var err error
-		cfgSnap.IngressGateway, err = cfgSnap.APIGateway.ToIngress(cfgSnap.Datacenter)
-		if err != nil {
-			return nil, err
-		}
-		return s.endpointsFromSnapshotIngressGateway(cfgSnap)
+		return s.endpointsFromSnapshotAPIGateway(cfgSnap)
 	default:
 		return nil, fmt.Errorf("Invalid service kind: %v", cfgSnap.Kind)
 	}
@@ -141,7 +138,10 @@ func (s *ResourceGenerator) endpointsFromSnapshotConnectProxy(cfgSnap *proxycfg.
 		endpoints, ok := cfgSnap.ConnectProxy.PreparedQueryEndpoints[uid]
 		if ok {
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				nil,
 				[]loadAssignmentEndpointGroup{
 					{Endpoints: endpoints},
 				},
@@ -164,7 +164,10 @@ func (s *ResourceGenerator) endpointsFromSnapshotConnectProxy(cfgSnap *proxycfg.
 			endpoints, ok := cfgSnap.ConnectProxy.DestinationGateways.Get(uid)
 			if ok {
 				la := makeLoadAssignment(
+					s.Logger,
+					cfgSnap,
 					name,
+					nil,
 					[]loadAssignmentEndpointGroup{
 						{Endpoints: endpoints},
 					},
@@ -230,7 +233,10 @@ func (s *ResourceGenerator) endpointsFromSnapshotMeshGateway(cfgSnap *proxycfg.C
 			clusterName := connect.GatewaySNI(key.Datacenter, key.Partition, cfgSnap.Roots.TrustDomain)
 
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				nil,
 				[]loadAssignmentEndpointGroup{
 					{Endpoints: endpoints},
 				},
@@ -245,7 +251,10 @@ func (s *ResourceGenerator) endpointsFromSnapshotMeshGateway(cfgSnap *proxycfg.C
 
 			clusterName := cfgSnap.ServerSNIFn(key.Datacenter, "")
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				nil,
 				[]loadAssignmentEndpointGroup{
 					{Endpoints: endpoints},
 				},
@@ -270,7 +279,7 @@ func (s *ResourceGenerator) endpointsFromSnapshotMeshGateway(cfgSnap *proxycfg.C
 			lbEndpoint := &envoy_endpoint_v3.LbEndpoint{
 				HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
 					Endpoint: &envoy_endpoint_v3.Endpoint{
-						Address: makeAddress(addr, port),
+						Address: response.MakeAddress(addr, port),
 					},
 				},
 				HealthStatus: envoy_core_v3.HealthStatus_UNKNOWN,
@@ -327,7 +336,7 @@ func (s *ResourceGenerator) endpointsFromSnapshotMeshGateway(cfgSnap *proxycfg.C
 			serverEndpoints = append(serverEndpoints, &envoy_endpoint_v3.LbEndpoint{
 				HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
 					Endpoint: &envoy_endpoint_v3.Endpoint{
-						Address: makeAddress(addr, port),
+						Address: response.MakeAddress(addr, port),
 					},
 				},
 			})
@@ -415,7 +424,10 @@ func (s *ResourceGenerator) endpointsFromServicesAndResolvers(
 		for subsetName, groups := range clusterEndpoints {
 			clusterName := connect.ServiceSNI(svc.Name, subsetName, svc.NamespaceOrDefault(), svc.PartitionOrDefault(), cfgSnap.Datacenter, cfgSnap.Roots.TrustDomain)
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				nil,
 				groups,
 				cfgSnap.Locality,
 			)
@@ -450,7 +462,10 @@ func (s *ResourceGenerator) makeEndpointsForOutgoingPeeredServices(
 			groups := []loadAssignmentEndpointGroup{{Endpoints: serviceGroup.Nodes, OnlyPassing: false}}
 
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				nil,
 				groups,
 				// Use an empty key here so that it never matches. This will force the mesh gateway to always
 				// reference the remote mesh gateway's wan addr.
@@ -527,12 +542,50 @@ func (s *ResourceGenerator) endpointsFromSnapshotIngressGateway(cfgSnap *proxycf
 	return resources, nil
 }
 
+func (s *ResourceGenerator) endpointsFromSnapshotAPIGateway(cfgSnap *proxycfg.ConfigSnapshot) ([]proto.Message, error) {
+	var resources []proto.Message
+	createdClusters := make(map[proxycfg.UpstreamID]struct{})
+
+	readyListeners := getReadyListeners(cfgSnap)
+
+	for _, readyListener := range readyListeners {
+		for _, u := range readyListener.upstreams {
+			uid := proxycfg.NewUpstreamID(&u)
+
+			// If we've already created endpoints for this upstream, skip it. Multiple listeners may
+			// reference the same upstream, so we don't need to create duplicate endpoints in that case.
+			_, ok := createdClusters[uid]
+			if ok {
+				continue
+			}
+
+			endpoints, err := s.endpointsFromDiscoveryChain(
+				uid,
+				cfgSnap.APIGateway.DiscoveryChain[uid],
+				cfgSnap,
+				proxycfg.GatewayKey{Datacenter: cfgSnap.Datacenter, Partition: u.DestinationPartition},
+				u.Config,
+				cfgSnap.APIGateway.WatchedUpstreamEndpoints[uid],
+				cfgSnap.APIGateway.WatchedGatewayEndpoints[uid],
+				false,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			resources = append(resources, endpoints...)
+			createdClusters[uid] = struct{}{}
+		}
+	}
+	return resources, nil
+}
+
 // used in clusters.go
 func makeEndpoint(host string, port int) *envoy_endpoint_v3.LbEndpoint {
 	return &envoy_endpoint_v3.LbEndpoint{
 		HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
 			Endpoint: &envoy_endpoint_v3.Endpoint{
-				Address: makeAddress(host, port),
+				Address: response.MakeAddress(host, port),
 			},
 		},
 	}
@@ -542,7 +595,7 @@ func makePipeEndpoint(path string) *envoy_endpoint_v3.LbEndpoint {
 	return &envoy_endpoint_v3.LbEndpoint{
 		HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
 			Endpoint: &envoy_endpoint_v3.Endpoint{
-				Address: makePipeAddress(path, 0),
+				Address: response.MakePipeAddress(path, 0),
 			},
 		},
 	}
@@ -574,7 +627,10 @@ func (s *ResourceGenerator) makeUpstreamLoadAssignmentForPeerService(
 			return la, nil
 		}
 		la = makeLoadAssignment(
+			s.Logger,
+			cfgSnap,
 			clusterName,
+			nil,
 			[]loadAssignmentEndpointGroup{
 				{Endpoints: localGw},
 			},
@@ -594,7 +650,10 @@ func (s *ResourceGenerator) makeUpstreamLoadAssignmentForPeerService(
 		return nil, nil
 	}
 	la = makeLoadAssignment(
+		s.Logger,
+		cfgSnap,
 		clusterName,
+		nil,
 		[]loadAssignmentEndpointGroup{
 			{Endpoints: endpoints},
 		},
@@ -628,6 +687,7 @@ func (s *ResourceGenerator) endpointsFromDiscoveryChain(
 
 	var escapeHatchCluster *envoy_cluster_v3.Cluster
 	if !forMeshGateway {
+
 		cfg, err := structs.ParseUpstreamConfigNoDefaults(upstreamConfigMap)
 		if err != nil {
 			// Don't hard fail on a config typo, just warn. The parse func returns
@@ -690,6 +750,7 @@ func (s *ResourceGenerator) endpointsFromDiscoveryChain(
 			}
 			switch len(groupedTarget.Targets) {
 			case 0:
+				s.Logger.Trace("skipping endpoint generation for zero-length target group", "cluster", clusterName)
 				continue
 			case 1:
 				// We expect one target so this passes through to continue setting the load assignment up.
@@ -697,7 +758,7 @@ func (s *ResourceGenerator) endpointsFromDiscoveryChain(
 				return nil, fmt.Errorf("cannot have more than one target")
 			}
 			ti := groupedTarget.Targets[0]
-			s.Logger.Debug("generating endpoints for", "cluster", clusterName, "targetID", ti.TargetID)
+			s.Logger.Trace("generating endpoints for", "cluster", clusterName, "targetID", ti.TargetID, "gatewayKey", gatewayKey)
 			targetUID := proxycfg.NewUpstreamIDFromTargetID(ti.TargetID)
 			if targetUID.Peer != "" {
 				loadAssignment, err := s.makeUpstreamLoadAssignmentForPeerService(cfgSnap, clusterName, targetUID, mgwMode)
@@ -719,11 +780,15 @@ func (s *ResourceGenerator) endpointsFromDiscoveryChain(
 				forMeshGateway,
 			)
 			if !valid {
+				s.Logger.Trace("skipping endpoint generation for invalid target group", "cluster", clusterName)
 				continue // skip the cluster if we're still populating the snapshot
 			}
 
 			la := makeLoadAssignment(
+				s.Logger,
+				cfgSnap,
 				clusterName,
+				ti.PrioritizeByLocality,
 				[]loadAssignmentEndpointGroup{endpointGroup},
 				gatewayKey,
 			)
@@ -743,8 +808,8 @@ func (s *ResourceGenerator) makeExportedUpstreamEndpointsForMeshGateway(cfgSnap 
 
 		chainEndpoints := make(map[string]structs.CheckServiceNodes)
 		for _, target := range chain.Targets {
-			if !cfgSnap.Locality.Matches(target.Datacenter, target.Partition) {
-				s.Logger.Warn("ignoring discovery chain target that crosses a datacenter or partition boundary in a mesh gateway",
+			if !cfgSnap.Locality.Matches(target.Datacenter, target.Partition) || target.Peer != "" {
+				s.Logger.Warn("ignoring discovery chain target that crosses a datacenter, peer, or partition boundary in a mesh gateway",
 					"target", target,
 					"gatewayLocality", cfgSnap.Locality,
 				)
@@ -809,49 +874,66 @@ type loadAssignmentEndpointGroup struct {
 	OverrideHealth envoy_core_v3.HealthStatus
 }
 
-func makeLoadAssignment(clusterName string, endpointGroups []loadAssignmentEndpointGroup, localKey proxycfg.GatewayKey) *envoy_endpoint_v3.ClusterLoadAssignment {
+func makeLoadAssignment(logger hclog.Logger, cfgSnap *proxycfg.ConfigSnapshot, clusterName string, policy *structs.DiscoveryPrioritizeByLocality, endpointGroups []loadAssignmentEndpointGroup, localKey proxycfg.GatewayKey) *envoy_endpoint_v3.ClusterLoadAssignment {
 	cla := &envoy_endpoint_v3.ClusterLoadAssignment{
 		ClusterName: clusterName,
 		Endpoints:   make([]*envoy_endpoint_v3.LocalityLbEndpoints, 0, len(endpointGroups)),
 	}
 
-	if len(endpointGroups) > 1 {
-		cla.Policy = &envoy_endpoint_v3.ClusterLoadAssignment_Policy{
-			// We choose such a large value here that the failover math should
-			// in effect not happen until zero instances are healthy.
-			OverprovisioningFactor: makeUint32Value(100000),
+	setFullFailoverProvisioningFactor := len(endpointGroups) > 1
+
+	var priority uint32
+
+	for _, endpointGroup := range endpointGroups {
+		endpointsByLocality, err := groupedEndpoints(logger, cfgSnap.ServiceLocality, policy, endpointGroup.Endpoints)
+
+		if err != nil {
+			continue
+		}
+
+		if len(endpointsByLocality) > 1 {
+			setFullFailoverProvisioningFactor = true
+		}
+
+		for _, endpoints := range endpointsByLocality {
+			es := make([]*envoy_endpoint_v3.LbEndpoint, 0, len(endpointGroup.Endpoints))
+
+			for _, ep := range endpoints {
+				// TODO (mesh-gateway) - should we respect the translate_wan_addrs configuration here or just always use the wan for cross-dc?
+				_, addr, port := ep.BestAddress(!localKey.Matches(ep.Node.Datacenter, ep.Node.PartitionOrDefault()))
+				healthStatus, weight := calculateEndpointHealthAndWeight(ep, endpointGroup.OnlyPassing)
+
+				if endpointGroup.OverrideHealth != envoy_core_v3.HealthStatus_UNKNOWN {
+					healthStatus = endpointGroup.OverrideHealth
+				}
+
+				endpoint := &envoy_endpoint_v3.Endpoint{
+					Address: response.MakeAddress(addr, port),
+				}
+				es = append(es, &envoy_endpoint_v3.LbEndpoint{
+					HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
+						Endpoint: endpoint,
+					},
+					HealthStatus:        healthStatus,
+					LoadBalancingWeight: response.MakeUint32Value(weight),
+				})
+			}
+
+			cla.Endpoints = append(cla.Endpoints, &envoy_endpoint_v3.LocalityLbEndpoints{
+				Priority:    priority,
+				LbEndpoints: es,
+			})
+
+			priority++
 		}
 	}
 
-	for priority, endpointGroup := range endpointGroups {
-		endpoints := endpointGroup.Endpoints
-		es := make([]*envoy_endpoint_v3.LbEndpoint, 0, len(endpoints))
-
-		for _, ep := range endpoints {
-			// TODO (mesh-gateway) - should we respect the translate_wan_addrs configuration here or just always use the wan for cross-dc?
-			_, addr, port := ep.BestAddress(!localKey.Matches(ep.Node.Datacenter, ep.Node.PartitionOrDefault()))
-			healthStatus, weight := calculateEndpointHealthAndWeight(ep, endpointGroup.OnlyPassing)
-
-			if endpointGroup.OverrideHealth != envoy_core_v3.HealthStatus_UNKNOWN {
-				healthStatus = endpointGroup.OverrideHealth
-			}
-
-			endpoint := &envoy_endpoint_v3.Endpoint{
-				Address: makeAddress(addr, port),
-			}
-			es = append(es, &envoy_endpoint_v3.LbEndpoint{
-				HostIdentifier: &envoy_endpoint_v3.LbEndpoint_Endpoint{
-					Endpoint: endpoint,
-				},
-				HealthStatus:        healthStatus,
-				LoadBalancingWeight: makeUint32Value(weight),
-			})
+	if setFullFailoverProvisioningFactor {
+		cla.Policy = &envoy_endpoint_v3.ClusterLoadAssignment_Policy{
+			// We choose such a large value here that the failover math should
+			// in effect not happen until zero instances are healthy.
+			OverprovisioningFactor: response.MakeUint32Value(100000),
 		}
-
-		cla.Endpoints = append(cla.Endpoints, &envoy_endpoint_v3.LocalityLbEndpoints{
-			Priority:    uint32(priority),
-			LbEndpoints: es,
-		})
 	}
 
 	return cla

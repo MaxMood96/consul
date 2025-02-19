@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package pbconfigentry
 
@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/proto/private/pbcommon"
 	"github.com/hashicorp/consul/types"
 )
@@ -84,6 +85,14 @@ func ConfigEntryToStructs(s *ConfigEntry) structs.ConfigEntry {
 		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
 		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
 		return &target
+	case Kind_KindFileSystemCertificate:
+		var target structs.FileSystemCertificateConfigEntry
+		target.Name = s.Name
+
+		FileSystemCertificateToStructs(s.GetFileSystemCertificate(), &target)
+		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
+		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
+		return &target
 	case Kind_KindInlineCertificate:
 		var target structs.InlineCertificateConfigEntry
 		target.Name = s.Name
@@ -97,6 +106,30 @@ func ConfigEntryToStructs(s *ConfigEntry) structs.ConfigEntry {
 		target.Name = s.Name
 
 		ServiceDefaultsToStructs(s.GetServiceDefaults(), &target)
+		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
+		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
+		return &target
+	case Kind_KindSamenessGroup:
+		var target structs.SamenessGroupConfigEntry
+		target.Name = s.Name
+
+		SamenessGroupToStructs(s.GetSamenessGroup(), &target)
+		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
+		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
+		return &target
+	case Kind_KindJWTProvider:
+		var target structs.JWTProviderConfigEntry
+		target.Name = s.Name
+
+		JWTProviderToStructs(s.GetJWTProvider(), &target)
+		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
+		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
+		return &target
+	case Kind_KindExportedServices:
+		var target structs.ExportedServicesConfigEntry
+		target.Name = s.Name
+
+		ExportedServicesToStructs(s.GetExportedServices(), &target)
 		pbcommon.RaftIndexToStructs(s.RaftIndex, &target.RaftIndex)
 		pbcommon.EnterpriseMetaToStructs(s.EnterpriseMeta, &target.EnterpriseMeta)
 		return &target
@@ -188,6 +221,14 @@ func ConfigEntryFromStructs(s structs.ConfigEntry) *ConfigEntry {
 		configEntry.Entry = &ConfigEntry_HTTPRoute{
 			HTTPRoute: &route,
 		}
+	case *structs.FileSystemCertificateConfigEntry:
+		var cert FileSystemCertificate
+		FileSystemCertificateFromStructs(v, &cert)
+
+		configEntry.Kind = Kind_KindFileSystemCertificate
+		configEntry.Entry = &ConfigEntry_FileSystemCertificate{
+			FileSystemCertificate: &cert,
+		}
 	case *structs.InlineCertificateConfigEntry:
 		var cert InlineCertificate
 		InlineCertificateFromStructs(v, &cert)
@@ -195,6 +236,29 @@ func ConfigEntryFromStructs(s structs.ConfigEntry) *ConfigEntry {
 		configEntry.Kind = Kind_KindInlineCertificate
 		configEntry.Entry = &ConfigEntry_InlineCertificate{
 			InlineCertificate: &cert,
+		}
+	case *structs.SamenessGroupConfigEntry:
+		var sg SamenessGroup
+		SamenessGroupFromStructs(v, &sg)
+		configEntry.Kind = Kind_KindSamenessGroup
+		configEntry.Entry = &ConfigEntry_SamenessGroup{
+			SamenessGroup: &sg,
+		}
+	case *structs.JWTProviderConfigEntry:
+		var jwtProvider JWTProvider
+		JWTProviderFromStructs(v, &jwtProvider)
+
+		configEntry.Kind = Kind_KindJWTProvider
+		configEntry.Entry = &ConfigEntry_JWTProvider{
+			JWTProvider: &jwtProvider,
+		}
+	case *structs.ExportedServicesConfigEntry:
+		var es ExportedServices
+		ExportedServicesFromStructs(v, &es)
+
+		configEntry.Kind = Kind_KindExportedServices
+		configEntry.Entry = &ConfigEntry_ExportedServices{
+			ExportedServices: &es,
 		}
 	default:
 		panic(fmt.Sprintf("unable to convert %T to proto", s))
@@ -225,6 +289,66 @@ func cipherSuitesFromStructs(cs []types.TLSCipherSuite) []string {
 		cipherSuites[idx] = suite.String()
 	}
 	return cipherSuites
+}
+
+func pathWithEscapedSlashesActionFromStructs(a structs.PathWithEscapedSlashesAction) PathWithEscapedSlashesAction {
+	switch a {
+	case structs.PathWithEscapedSlashesActionDefault:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionDefault
+	case structs.PathWithEscapedSlashesActionKeep:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionKeep
+	case structs.PathWithEscapedSlashesActionReject:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionReject
+	case structs.PathWithEscapedSlashesActionUnescapeAndRedirect:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionUnescapeAndRedirect
+	case structs.PathWithEscapedSlashesActionUnescapeAndForward:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionUnescapeAndForward
+	default:
+		return PathWithEscapedSlashesAction_PathWithEscapedSlashesActionDefault
+	}
+}
+
+func pathWithEscapedSlashesActionToStructs(a PathWithEscapedSlashesAction) structs.PathWithEscapedSlashesAction {
+	switch a {
+	case PathWithEscapedSlashesAction_PathWithEscapedSlashesActionDefault:
+		return structs.PathWithEscapedSlashesActionDefault
+	case PathWithEscapedSlashesAction_PathWithEscapedSlashesActionKeep:
+		return structs.PathWithEscapedSlashesActionKeep
+	case PathWithEscapedSlashesAction_PathWithEscapedSlashesActionReject:
+		return structs.PathWithEscapedSlashesActionReject
+	case PathWithEscapedSlashesAction_PathWithEscapedSlashesActionUnescapeAndRedirect:
+		return structs.PathWithEscapedSlashesActionUnescapeAndRedirect
+	case PathWithEscapedSlashesAction_PathWithEscapedSlashesActionUnescapeAndForward:
+		return structs.PathWithEscapedSlashesActionUnescapeAndForward
+	default:
+		return structs.PathWithEscapedSlashesActionDefault
+	}
+}
+
+func headersWithUnderscoresActionFromStructs(a structs.HeadersWithUnderscoresAction) HeadersWithUnderscoresAction {
+	switch a {
+	case structs.HeadersWithUnderscoresActionAllow:
+		return HeadersWithUnderscoresAction_HeadersWithUnderscoresActionAllow
+	case structs.HeadersWithUnderscoresActionRejectRequest:
+		return HeadersWithUnderscoresAction_HeadersWithUnderscoresActionRejectRequest
+	case structs.HeadersWithUnderscoresActionDropHeader:
+		return HeadersWithUnderscoresAction_HeadersWithUnderscoresActionDropHeader
+	default:
+		return HeadersWithUnderscoresAction_HeadersWithUnderscoresActionAllow
+	}
+}
+
+func headersWithUnderscoresActionToStructs(a HeadersWithUnderscoresAction) structs.HeadersWithUnderscoresAction {
+	switch a {
+	case HeadersWithUnderscoresAction_HeadersWithUnderscoresActionAllow:
+		return structs.HeadersWithUnderscoresActionAllow
+	case HeadersWithUnderscoresAction_HeadersWithUnderscoresActionRejectRequest:
+		return structs.HeadersWithUnderscoresActionRejectRequest
+	case HeadersWithUnderscoresAction_HeadersWithUnderscoresActionDropHeader:
+		return structs.HeadersWithUnderscoresActionDropHeader
+	default:
+		return structs.HeadersWithUnderscoresActionAllow
+	}
 }
 
 func enterpriseMetaToStructs(m *pbcommon.EnterpriseMeta) acl.EnterpriseMeta {
@@ -321,6 +445,32 @@ func proxyModeToStructs(a ProxyMode) structs.ProxyMode {
 		return structs.ProxyModeDirect
 	default:
 		return structs.ProxyModeDefault
+	}
+}
+
+func mutualTLSModeFromStructs(a structs.MutualTLSMode) MutualTLSMode {
+	switch a {
+	case structs.MutualTLSModeDefault:
+		return MutualTLSMode_MutualTLSModeDefault
+	case structs.MutualTLSModeStrict:
+		return MutualTLSMode_MutualTLSModeStrict
+	case structs.MutualTLSModePermissive:
+		return MutualTLSMode_MutualTLSModePermissive
+	default:
+		return MutualTLSMode_MutualTLSModeDefault
+	}
+}
+
+func mutualTLSModeToStructs(a MutualTLSMode) structs.MutualTLSMode {
+	switch a {
+	case MutualTLSMode_MutualTLSModeDefault:
+		return structs.MutualTLSModeDefault
+	case MutualTLSMode_MutualTLSModeStrict:
+		return structs.MutualTLSModeStrict
+	case MutualTLSMode_MutualTLSModePermissive:
+		return structs.MutualTLSModePermissive
+	default:
+		return structs.MutualTLSModeDefault
 	}
 }
 
@@ -514,4 +664,50 @@ func httpQueryMatchToStructs(a HTTPQueryMatchType) structs.HTTPQueryMatchType {
 	default:
 		return structs.HTTPQueryMatchExact
 	}
+}
+
+// mog: func-to=serviceRefsToStructs func-from=serviceRefFromStructs
+func serviceRefsToStructs(a map[string]*ListOfResourceReference) structs.ServiceRouteReferences {
+	m := make(structs.ServiceRouteReferences, len(a))
+
+	for key, refs := range a {
+		serviceName := structs.ServiceNameFromString(key)
+		m[serviceName] = make([]structs.ResourceReference, 0, len(refs.Ref))
+		for _, ref := range refs.Ref {
+			structsRef := structs.ResourceReference{}
+			ResourceReferenceToStructs(ref, &structsRef)
+			m[serviceName] = append(m[serviceName], structsRef)
+		}
+	}
+	return m
+}
+
+func serviceRefFromStructs(a structs.ServiceRouteReferences) map[string]*ListOfResourceReference {
+	m := make(map[string]*ListOfResourceReference, len(a))
+
+	for serviceName, refs := range a {
+		name := serviceName.String()
+		m[name] = &ListOfResourceReference{Ref: make([]*ResourceReference, len(refs))}
+		for _, ref := range refs {
+			resourceRef := &ResourceReference{}
+			ResourceReferenceFromStructs(&ref, resourceRef)
+			m[name].Ref = append(m[name].Ref, resourceRef)
+		}
+	}
+	return m
+}
+
+func (r *ResolvedExportedService) ToAPI() *api.ResolvedExportedService {
+	var t api.ResolvedExportedService
+
+	t.Service = r.Service
+	if r.EnterpriseMeta != nil {
+		t.Namespace = r.EnterpriseMeta.Namespace
+		t.Partition = r.EnterpriseMeta.Partition
+	}
+
+	t.Consumers.Peers = r.Consumers.Peers
+	t.Consumers.Partitions = r.Consumers.Partitions
+
+	return &t
 }

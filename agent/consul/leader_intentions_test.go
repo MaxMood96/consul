@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -523,7 +523,7 @@ func TestLeader_LegacyIntentionMigration(t *testing.T) {
 
 	// Wait until the migration routine is complete.
 	retry.Run(t, func(r *retry.R) {
-		intentionFormat, err := s1.getSystemMetadata(structs.SystemMetadataIntentionFormatKey)
+		intentionFormat, err := s1.GetSystemMetadata(structs.SystemMetadataIntentionFormatKey)
 		require.NoError(r, err)
 		if intentionFormat != structs.SystemMetadataIntentionFormatConfigValue {
 			r.Fatal("intention migration is not yet complete")

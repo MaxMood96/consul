@@ -1,10 +1,20 @@
-# Techical Writer Review
+* @hashicorp/consul-selfmanage-maintainers
 
-/website/content/docs/ @hashicorp/consul-docs
-/website/content/commands/ @hashicorp/consul-docs
-/website/content/api-docs/ @hashicorp/consul-docs
+
+# engineering and web presence get notified of, and can approve changes to web tooling, but not content.
+
+/website/           @hashicorp/web-presence @hashicorp/consul-selfmanage-maintainers
+/website/data/
+/website/public/
+/website/content/
+
+# education and engineering get notified of, and can approve changes to web content.
+
+/website/data/          @hashicorp/consul-docs @hashicorp/consul-selfmanage-maintainers
+/website/public/        @hashicorp/consul-docs @hashicorp/consul-selfmanage-maintainers
+/website/content/       @hashicorp/consul-docs @hashicorp/consul-selfmanage-maintainers
 
 
 # release configuration
-/.release/                              @hashicorp/release-engineering @hashicorp/github-consul-core
-/.github/workflows/build.yml            @hashicorp/release-engineering @hashicorp/github-consul-core
+/.release/                              @hashicorp/team-selfmanaged-releng @hashicorp/consul-selfmanage-maintainers
+/.github/workflows/build.yml            @hashicorp/team-selfmanaged-releng @hashicorp/consul-selfmanage-maintainers
