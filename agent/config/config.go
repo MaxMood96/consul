@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package config
 
@@ -8,8 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hashicorp/hcl"
 	"github.com/mitchellh/mapstructure"
+
+	"github.com/hashicorp/hcl"
 
 	"github.com/hashicorp/consul/lib/decode"
 )
@@ -165,6 +166,7 @@ type Config struct {
 	DataDir                          *string             `mapstructure:"data_dir" json:"data_dir,omitempty"`
 	Datacenter                       *string             `mapstructure:"datacenter" json:"datacenter,omitempty"`
 	DefaultQueryTime                 *string             `mapstructure:"default_query_time" json:"default_query_time,omitempty"`
+	DefaultIntentionPolicy           *string             `mapstructure:"default_intention_policy" json:"default_intention_policy,omitempty"`
 	DisableAnonymousSignature        *bool               `mapstructure:"disable_anonymous_signature" json:"disable_anonymous_signature,omitempty"`
 	DisableCoordinates               *bool               `mapstructure:"disable_coordinates" json:"disable_coordinates,omitempty"`
 	DisableHostNodeID                *bool               `mapstructure:"disable_host_node_id" json:"disable_host_node_id,omitempty"`
@@ -183,6 +185,7 @@ type Config struct {
 	EncryptKey                       *string             `mapstructure:"encrypt" json:"encrypt,omitempty"`
 	EncryptVerifyIncoming            *bool               `mapstructure:"encrypt_verify_incoming" json:"encrypt_verify_incoming,omitempty"`
 	EncryptVerifyOutgoing            *bool               `mapstructure:"encrypt_verify_outgoing" json:"encrypt_verify_outgoing,omitempty"`
+	Experiments                      []string            `mapstructure:"experiments" json:"experiments,omitempty"`
 	GossipLAN                        GossipLANConfig     `mapstructure:"gossip_lan" json:"-"`
 	GossipWAN                        GossipWANConfig     `mapstructure:"gossip_wan" json:"-"`
 	HTTPConfig                       HTTPConfig          `mapstructure:"http_config" json:"-"`
@@ -212,6 +215,7 @@ type Config struct {
 	RaftSnapshotThreshold            *int                `mapstructure:"raft_snapshot_threshold" json:"raft_snapshot_threshold,omitempty"`
 	RaftSnapshotInterval             *string             `mapstructure:"raft_snapshot_interval" json:"raft_snapshot_interval,omitempty"`
 	RaftTrailingLogs                 *int                `mapstructure:"raft_trailing_logs" json:"raft_trailing_logs,omitempty"`
+	RaftPreVoteDisabled              *bool               `mapstructure:"raft_prevote_disabled" json:"raft_prevote_disabled,omitempty"`
 	ReconnectTimeoutLAN              *string             `mapstructure:"reconnect_timeout" json:"reconnect_timeout,omitempty"`
 	ReconnectTimeoutWAN              *string             `mapstructure:"reconnect_timeout_wan" json:"reconnect_timeout_wan,omitempty"`
 	RejoinAfterLeave                 *bool               `mapstructure:"rejoin_after_leave" json:"rejoin_after_leave,omitempty"`
@@ -228,6 +232,7 @@ type Config struct {
 	SerfBindAddrWAN                  *string             `mapstructure:"serf_wan" json:"serf_wan,omitempty"`
 	ServerMode                       *bool               `mapstructure:"server" json:"server,omitempty"`
 	ServerName                       *string             `mapstructure:"server_name" json:"server_name,omitempty"`
+	ServerRejoinAgeMax               *string             `mapstructure:"server_rejoin_age_max" json:"server_rejoin_age_max,omitempty"`
 	Service                          *ServiceDefinition  `mapstructure:"service" json:"-"`
 	Services                         []ServiceDefinition `mapstructure:"services" json:"-"`
 	SessionTTLMin                    *string             `mapstructure:"session_ttl_min" json:"session_ttl_min,omitempty"`
@@ -402,6 +407,7 @@ type ServiceDefinition struct {
 	EnableTagOverride *bool                     `mapstructure:"enable_tag_override"`
 	Proxy             *ServiceProxy             `mapstructure:"proxy"`
 	Connect           *ServiceConnect           `mapstructure:"connect"`
+	Locality          *Locality                 `mapstructure:"locality"`
 
 	EnterpriseMeta `mapstructure:",squash"`
 }
@@ -421,6 +427,7 @@ type CheckDefinition struct {
 	DisableRedirects               *bool               `mapstructure:"disable_redirects"`
 	OutputMaxSize                  *int                `mapstructure:"output_max_size"`
 	TCP                            *string             `mapstructure:"tcp"`
+	TCPUseTLS                      *bool               `mapstructure:"tcp_use_tls"`
 	UDP                            *string             `mapstructure:"udp"`
 	Interval                       *string             `mapstructure:"interval"`
 	DockerContainerID              *string             `mapstructure:"docker_container_id" alias:"dockercontainerid"`
@@ -670,9 +677,11 @@ type HTTPConfig struct {
 }
 
 type Performance struct {
-	LeaveDrainTime *string `mapstructure:"leave_drain_time"`
-	RaftMultiplier *int    `mapstructure:"raft_multiplier"` // todo(fs): validate as uint
-	RPCHoldTimeout *string `mapstructure:"rpc_hold_timeout"`
+	LeaveDrainTime        *string `mapstructure:"leave_drain_time"`
+	RaftMultiplier        *int    `mapstructure:"raft_multiplier"` // todo(fs): validate as uint
+	RPCHoldTimeout        *string `mapstructure:"rpc_hold_timeout"`
+	GRPCKeepaliveInterval *string `mapstructure:"grpc_keepalive_interval"`
+	GRPCKeepaliveTimeout  *string `mapstructure:"grpc_keepalive_timeout"`
 }
 
 type Telemetry struct {
@@ -690,6 +699,8 @@ type Telemetry struct {
 	CirconusSubmissionInterval         *string  `mapstructure:"circonus_submission_interval" json:"circonus_submission_interval,omitempty"`
 	CirconusSubmissionURL              *string  `mapstructure:"circonus_submission_url" json:"circonus_submission_url,omitempty"`
 	DisableHostname                    *bool    `mapstructure:"disable_hostname" json:"disable_hostname,omitempty"`
+	DisablePerTenancyUsageMetrics      *bool    `mapstructure:"disable_per_tenancy_usage_metrics" json:"disable_per_tenancy_usage_metrics,omitempty"`
+	EnableHostMetrics                  *bool    `mapstructure:"enable_host_metrics" json:"enable_host_metrics,omitempty"`
 	DogstatsdAddr                      *string  `mapstructure:"dogstatsd_addr" json:"dogstatsd_addr,omitempty"`
 	DogstatsdTags                      []string `mapstructure:"dogstatsd_tags" json:"dogstatsd_tags,omitempty"`
 	RetryFailedConfiguration           *bool    `mapstructure:"retry_failed_connection" json:"retry_failed_connection,omitempty"`
@@ -774,6 +785,7 @@ type Tokens struct {
 	Default                *string `mapstructure:"default"`
 	Agent                  *string `mapstructure:"agent"`
 	ConfigFileRegistration *string `mapstructure:"config_file_service_registration"`
+	DNS                    *string `mapstructure:"dns"`
 
 	// Enterprise Only
 	ManagedServiceProvider []ServiceProviderToken `mapstructure:"managed_service_provider"`
@@ -805,8 +817,9 @@ type ConfigEntries struct {
 
 // Audit allows us to enable and define destinations for auditing
 type Audit struct {
-	Enabled *bool                `mapstructure:"enabled"`
-	Sinks   map[string]AuditSink `mapstructure:"sink"`
+	Enabled    *bool                `mapstructure:"enabled"`
+	Sinks      map[string]AuditSink `mapstructure:"sink"`
+	RPCEnabled *bool                `mapstructure:"rpc_enabled"`
 }
 
 // AuditSink can be provided multiple times to define pipelines for auditing

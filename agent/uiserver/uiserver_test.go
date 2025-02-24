@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package uiserver
 
@@ -13,9 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/html"
+
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/sdk/testutil"

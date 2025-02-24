@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package health
 
@@ -10,19 +10,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hashicorp/go-bexpr"
-	"github.com/hashicorp/go-hclog"
-	"google.golang.org/grpc"
-
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/agent/submatview"
 	"github.com/hashicorp/consul/proto/private/pbservice"
 	"github.com/hashicorp/consul/proto/private/pbsubscribe"
+	"github.com/hashicorp/go-bexpr"
 )
-
-type MaterializerDeps struct {
-	Conn   *grpc.ClientConn
-	Logger hclog.Logger
-}
 
 func NewMaterializerRequest(srvReq structs.ServiceSpecificRequest) func(index uint64) *pbsubscribe.SubscribeRequest {
 	return func(index uint64) *pbsubscribe.SubscribeRequest {
@@ -53,12 +46,15 @@ func NewHealthView(req structs.ServiceSpecificRequest) (*HealthView, error) {
 		return nil, err
 	}
 	return &HealthView{
-		state:   make(map[string]structs.CheckServiceNode),
-		filter:  fe,
-		connect: req.Connect,
-		kind:    req.ServiceKind,
+		state:            make(map[string]structs.CheckServiceNode),
+		filter:           fe,
+		connect:          req.Connect,
+		kind:             req.ServiceKind,
+		healthFilterType: req.HealthFilterType,
 	}, nil
 }
+
+var _ submatview.View = (*HealthView)(nil)
 
 // HealthView implements submatview.View for storing the view state
 // of a service health result. We store it as a map to make updates and
@@ -66,10 +62,11 @@ func NewHealthView(req structs.ServiceSpecificRequest) (*HealthView, error) {
 // (IndexedCheckServiceNodes) and update it in place for each event - that
 // involves re-sorting each time etc. though.
 type HealthView struct {
-	connect bool
-	kind    structs.ServiceKind
-	state   map[string]structs.CheckServiceNode
-	filter  filterEvaluator
+	connect          bool
+	kind             structs.ServiceKind
+	state            map[string]structs.CheckServiceNode
+	filter           filterEvaluator
+	healthFilterType structs.HealthFilterType
 }
 
 // Update implements View
@@ -90,6 +87,11 @@ func (s *HealthView) Update(events []*pbsubscribe.Event) error {
 			}
 			if csn == nil {
 				return errors.New("check service node was unexpectedly nil")
+			}
+
+			if csn.ExcludeBasedOnChecks(structs.CheckServiceNodeFilterOptions{FilterType: s.healthFilterType}) {
+				delete(s.state, id)
+				continue
 			}
 
 			// check if we intentionally need to skip the filter

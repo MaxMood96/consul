@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package health
 
@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/agent/rpcclient"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/consul/agent/cache"
@@ -25,12 +26,14 @@ func TestClient_ServiceNodes_BackendRouting(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		c := &Client{
-			NetRPC:              &fakeNetRPC{},
-			Cache:               &fakeCache{},
-			ViewStore:           &fakeViewStore{},
-			CacheName:           "cache-no-streaming",
-			UseStreamingBackend: true,
-			QueryOptionDefaults: config.ApplyDefaultQueryOptions(&config.RuntimeConfig{}),
+			Client: rpcclient.Client{
+				NetRPC:              &fakeNetRPC{},
+				Cache:               &fakeCache{},
+				ViewStore:           &fakeViewStore{},
+				CacheName:           "cache-no-streaming",
+				UseStreamingBackend: true,
+				QueryOptionDefaults: config.ApplyDefaultQueryOptions(&config.RuntimeConfig{}),
+			},
 		}
 
 		_, _, err := c.ServiceNodes(context.Background(), tc.req)
@@ -91,6 +94,17 @@ func TestClient_ServiceNodes_BackendRouting(t *testing.T) {
 				Datacenter:         "dc1",
 				ServiceName:        "web1",
 				MergeCentralConfig: true,
+				QueryOptions:       structs.QueryOptions{MinQueryIndex: 22},
+			},
+			expected: useRPC,
+		},
+		{
+			name: "rpc if sameness group",
+			req: structs.ServiceSpecificRequest{
+				Datacenter:         "dc1",
+				ServiceName:        "web1",
+				SamenessGroup:      "sg1",
+				MergeCentralConfig: false,
 				QueryOptions:       structs.QueryOptions{MinQueryIndex: 22},
 			},
 			expected: useRPC,
@@ -202,11 +216,13 @@ func TestClient_Notify_BackendRouting(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		c := &Client{
-			NetRPC:              &fakeNetRPC{},
-			Cache:               &fakeCache{},
-			ViewStore:           &fakeViewStore{},
-			CacheName:           "cache-no-streaming",
-			UseStreamingBackend: true,
+			Client: rpcclient.Client{
+				NetRPC:              &fakeNetRPC{},
+				Cache:               &fakeCache{},
+				ViewStore:           &fakeViewStore{},
+				CacheName:           "cache-no-streaming",
+				UseStreamingBackend: true,
+			},
 		}
 
 		err := c.Notify(context.Background(), tc.req, "cid", nil)
@@ -241,6 +257,15 @@ func TestClient_Notify_BackendRouting(t *testing.T) {
 			},
 			expected: useCache,
 		},
+		{
+			name: "use cache for sameness group request",
+			req: structs.ServiceSpecificRequest{
+				Datacenter:    "dc1",
+				ServiceName:   "web1",
+				SamenessGroup: "test-group",
+			},
+			expected: useCache,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -253,13 +278,15 @@ func TestClient_Notify_BackendRouting(t *testing.T) {
 func TestClient_ServiceNodes_SetsDefaults(t *testing.T) {
 	store := &fakeViewStore{}
 	c := &Client{
-		ViewStore:           store,
-		CacheName:           "cache-no-streaming",
-		UseStreamingBackend: true,
-		QueryOptionDefaults: config.ApplyDefaultQueryOptions(&config.RuntimeConfig{
-			MaxQueryTime:     200 * time.Second,
-			DefaultQueryTime: 100 * time.Second,
-		}),
+		Client: rpcclient.Client{
+			ViewStore:           store,
+			CacheName:           "cache-no-streaming",
+			UseStreamingBackend: true,
+			QueryOptionDefaults: config.ApplyDefaultQueryOptions(&config.RuntimeConfig{
+				MaxQueryTime:     200 * time.Second,
+				DefaultQueryTime: 100 * time.Second,
+			}),
+		},
 	}
 
 	req := structs.ServiceSpecificRequest{

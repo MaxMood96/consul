@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 
 set -euo pipefail
@@ -54,6 +54,17 @@ sources {
     {
       action = "allow"
       http {
+        path_exact = "/hdr-exact-ignore-case"
+        header = [{
+          name  = "x-test-debug"
+          exact = "foo.bar.com"
+          ignore_case = true
+        }]
+      }
+    },
+    {
+      action = "allow"
+      http {
         path_exact = "/hdr-prefix"
         header = [{
           name   = "x-test-debug"
@@ -64,10 +75,53 @@ sources {
     {
       action = "allow"
       http {
+        path_exact = "/hdr-prefix-ignore-case"
+        header = [{
+          name   = "x-test-debug"
+          prefix = "foo.bar"
+          ignore_case = true
+        }]
+      }
+    },
+    {
+      action = "allow"
+      http {
         path_exact = "/hdr-suffix"
         header = [{
           name   = "x-test-debug"
           suffix = "uffix"
+        }]
+      }
+    },
+    {
+      action = "allow"
+      http {
+        path_exact = "/hdr-suffix-ignore-case"
+        header = [{
+          name   = "x-test-debug"
+          suffix = "bar.com"
+          ignore_case = true
+        }]
+      }
+    },
+    {
+      action = "allow"
+      http {
+        path_exact = "/hdr-contains"
+        header = [{
+          name   = "x-test-debug"
+          contains = "contains"
+        }]
+      }
+    },
+    {
+      action = "allow"
+      http {
+        path_exact = "/hdr-contains-ignore-case"
+        header = [{
+          name   = "x-test-debug"
+          contains = "contains"
+          ignore_case = true
         }]
       }
     },

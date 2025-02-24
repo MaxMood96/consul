@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -34,7 +34,7 @@ import (
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 
-	"gopkg.in/square/go-jose.v2/jwt"
+	"github.com/go-jose/go-jose/v3/jwt"
 )
 
 type mockAutoConfigBackend struct {

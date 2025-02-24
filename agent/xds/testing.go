@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package xds
 
@@ -125,15 +125,15 @@ func stringToEnvoyVersion(vs string) (*envoy_type_v3.SemanticVersion, bool) {
 		return nil, false
 	}
 
-	major, err := strconv.Atoi(parts[0])
+	major, err := strconv.ParseUint(parts[0], 10, 32)
 	if err != nil {
 		return nil, false
 	}
-	minor, err := strconv.Atoi(parts[1])
+	minor, err := strconv.ParseUint(parts[1], 10, 32)
 	if err != nil {
 		return nil, false
 	}
-	patch, err := strconv.Atoi(parts[2])
+	patch, err := strconv.ParseUint(parts[2], 10, 32)
 	if err != nil {
 		return nil, false
 	}

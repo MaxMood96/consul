@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package assert
 
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -13,16 +14,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/sdk/testutil/retry"
-	libcluster "github.com/hashicorp/consul/test/integration/consul-container/libs/cluster"
-	"github.com/hashicorp/consul/test/integration/consul-container/libs/utils"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/hashicorp/consul/sdk/testutil/retry"
+
+	libcluster "github.com/hashicorp/consul/test/integration/consul-container/libs/cluster"
+	"github.com/hashicorp/consul/test/integration/consul-container/libs/utils"
 )
 
 // GetEnvoyListenerTCPFilters validates that proxy was configured with tcp protocol and one rbac listener filter
 func GetEnvoyListenerTCPFilters(t *testing.T, adminPort int) {
+	require.True(t, adminPort > 0)
+
+	GetEnvoyListenerTCPFiltersWithClient(
+		t,
+		cleanhttp.DefaultClient(),
+		fmt.Sprintf("localhost:%d", adminPort),
+	)
+}
+
+func GetEnvoyListenerTCPFiltersWithClient(
+	t *testing.T,
+	client *http.Client,
+	addr string,
+) {
 	var (
 		dump string
 		err  error
@@ -32,7 +49,7 @@ func GetEnvoyListenerTCPFilters(t *testing.T, adminPort int) {
 	}
 
 	retry.RunWith(failer(), t, func(r *retry.R) {
-		dump, _, err = GetEnvoyOutput(adminPort, "config_dump", map[string]string{})
+		dump, _, err = GetEnvoyOutputWithClient(client, addr, "config_dump", map[string]string{})
 		if err != nil {
 			r.Fatal("could not fetch envoy configuration")
 		}
@@ -55,35 +72,64 @@ func GetEnvoyListenerTCPFilters(t *testing.T, adminPort int) {
 	require.Contains(t, filteredResult, "envoy.filters.network.tcp_proxy")
 }
 
+// func GetEnvoyOutputWithClient(client *http.Client, addr string, path string, query map[string]string) (string, int, error) {
+
 // AssertUpstreamEndpointStatus validates that proxy was configured with provided clusterName in the healthStatus
 func AssertUpstreamEndpointStatus(t *testing.T, adminPort int, clusterName, healthStatus string, count int) {
-	var (
-		clusters string
-		err      error
+	t.Helper()
+	require.True(t, adminPort > 0)
+	AssertUpstreamEndpointStatusWithClient(
+		t,
+		cleanhttp.DefaultClient(),
+		fmt.Sprintf("localhost:%d", adminPort),
+		clusterName,
+		healthStatus,
+		count,
 	)
+}
+
+func AssertUpstreamEndpointStatusWithClient(
+	t *testing.T,
+	client *http.Client,
+	addr string,
+	clusterName string,
+	healthStatus string,
+	count int,
+) {
+	t.Helper()
+	require.NotNil(t, client)
+	require.NotEmpty(t, addr)
 	failer := func() *retry.Timer {
 		return &retry.Timer{Timeout: 30 * time.Second, Wait: 500 * time.Millisecond}
 	}
 
 	retry.RunWith(failer(), t, func(r *retry.R) {
-		clusters, _, err = GetEnvoyOutput(adminPort, "clusters", map[string]string{"format": "json"})
+		clusters, statusCode, err := GetEnvoyOutputWithClient(client, addr, "clusters", map[string]string{"format": "json"})
 		if err != nil {
 			r.Fatal("could not fetch envoy clusters")
 		}
+		require.Equal(r, 200, statusCode)
 
-		filter := fmt.Sprintf(`.cluster_statuses[] | select(.name|contains("%s")) | [.host_statuses[].health_status.eds_health_status] | [select(.[] == "%s")] | length`, clusterName, healthStatus)
+		filter := fmt.Sprintf(
+			`.cluster_statuses[]
+			| select(.name|contains("%s"))
+			| [.host_statuses[].health_status.eds_health_status]
+			| [select(.[] == "%s")]
+			| length`,
+			clusterName, healthStatus)
 		results, err := utils.JQFilter(clusters, filter)
-		require.NoErrorf(r, err, "could not found cluster name %s", clusterName)
+		require.NoErrorf(r, err, "could not find cluster name %q: %v \n%s", clusterName, err, clusters)
+		require.Len(r, results, 1, "clusters: "+clusters) // the final part of the pipeline is "length" which only ever returns 1 result
 
-		resultToString := strings.Join(results, " ")
-		result, err := strconv.Atoi(resultToString)
+		result, err := strconv.Atoi(results[0])
 		assert.NoError(r, err)
-		require.Equal(r, count, result)
+		require.Equal(r, count, result, "original results: %v", clusters)
 	})
 }
 
 // AssertEnvoyMetricAtMost assert the filered metric by prefix and metric is >= count
 func AssertEnvoyMetricAtMost(t *testing.T, adminPort int, prefix, metric string, count int) {
+	t.Helper()
 	var (
 		stats string
 		err   error
@@ -152,41 +198,6 @@ func AssertEnvoyMetricAtLeast(t *testing.T, adminPort int, prefix, metric string
 	})
 }
 
-// GetEnvoyHTTPrbacFilters validates that proxy was configured with an http connection manager
-// AssertEnvoyHTTPrbacFilters validates that proxy was configured with an http connection manager
-// this assertion is currently unused current tests use http protocol
-func AssertEnvoyHTTPrbacFilters(t *testing.T, port int) {
-	var (
-		dump string
-		err  error
-	)
-	failer := func() *retry.Timer {
-		return &retry.Timer{Timeout: 30 * time.Second, Wait: 1 * time.Second}
-	}
-
-	retry.RunWith(failer(), t, func(r *retry.R) {
-		dump, _, err = GetEnvoyOutput(port, "config_dump", map[string]string{})
-		if err != nil {
-			r.Fatal("could not fetch envoy configuration")
-		}
-	})
-
-	// the steps below validate that the json result from envoy config dump configured active listeners with rbac and http filters
-	filter := `.configs[2].dynamic_listeners[].active_state.listener | "\(.name) \( .filter_chains[0].filters[] | select(.name == "envoy.filters.network.http_connection_manager") | .typed_config.http_filters | map(.name) | join(","))"`
-	results, err := utils.JQFilter(dump, filter)
-	require.NoError(t, err, "could not parse envoy configuration")
-	require.Len(t, results, 1, "static-server proxy should have been configured with two listener filters.")
-
-	var filteredResult []string
-	for _, result := range results {
-		sanitizedResult := sanitizeResult(result)
-		filteredResult = append(filteredResult, sanitizedResult...)
-	}
-	require.Contains(t, filteredResult, "envoy.filters.http.rbac")
-	assert.Contains(t, filteredResult, "envoy.filters.http.header_to_metadata")
-	assert.Contains(t, filteredResult, "envoy.filters.http.router")
-}
-
 // AssertEnvoyPresentsCertURI makes GET request to /certs endpoint and validates that
 // two certificates URI is available in the response
 func AssertEnvoyPresentsCertURI(t *testing.T, port int, serviceName string) {
@@ -205,7 +216,29 @@ func AssertEnvoyPresentsCertURI(t *testing.T, port int, serviceName string) {
 		}
 		require.NotNil(r, dump)
 	})
+	validateEnvoyCertificateURI(t, dump, serviceName)
+}
 
+func AssertEnvoyPresentsCertURIWithClient(t *testing.T, client *http.Client, addr string, serviceName string) {
+	var (
+		dump string
+		err  error
+	)
+	failer := func() *retry.Timer {
+		return &retry.Timer{Timeout: 30 * time.Second, Wait: 1 * time.Second}
+	}
+
+	retry.RunWith(failer(), t, func(r *retry.R) {
+		dump, _, err = GetEnvoyOutputWithClient(client, addr, "certs", nil)
+		if err != nil {
+			r.Fatal("could not fetch envoy configuration")
+		}
+		require.NotNil(r, dump)
+	})
+	validateEnvoyCertificateURI(t, dump, serviceName)
+}
+
+func validateEnvoyCertificateURI(t *testing.T, dump string, serviceName string) {
 	// Validate certificate uri
 	filter := `.certificates[] | .cert_chain[].subject_alt_names[].uri`
 	results, err := utils.JQFilter(dump, filter)
@@ -238,10 +271,30 @@ func AssertEnvoyRunning(t *testing.T, port int) {
 	})
 }
 
+func AssertEnvoyRunningWithClient(t *testing.T, client *http.Client, addr string) {
+	var (
+		err error
+	)
+	failer := func() *retry.Timer {
+		return &retry.Timer{Timeout: 10 * time.Second, Wait: 500 * time.Millisecond}
+	}
+
+	retry.RunWith(failer(), t, func(r *retry.R) {
+		_, _, err = GetEnvoyOutputWithClient(client, addr, "stats", nil)
+		if err != nil {
+			r.Fatal("could not fetch envoy stats")
+		}
+	})
+}
+
 func GetEnvoyOutput(port int, path string, query map[string]string) (string, int, error) {
 	client := cleanhttp.DefaultClient()
+	return GetEnvoyOutputWithClient(client, fmt.Sprintf("localhost:%d", port), path, query)
+}
+
+func GetEnvoyOutputWithClient(client *http.Client, addr string, path string, query map[string]string) (string, int, error) {
 	var u url.URL
-	u.Host = fmt.Sprintf("localhost:%d", port)
+	u.Host = addr
 	u.Scheme = "http"
 	if path != "" {
 		u.Path = path
@@ -267,6 +320,15 @@ func GetEnvoyOutput(port int, path string, query map[string]string) (string, int
 	}
 
 	return string(body), statusCode, nil
+}
+
+func ResetEnvoyCounters(client *http.Client, addr string) (int, error) {
+	var u url.URL
+	u.Host = addr
+	u.Scheme = "http"
+
+	res, err := client.Post(fmt.Sprintf("%s/reset_counters", u.String()), "application/json", nil)
+	return res.StatusCode, err
 }
 
 // sanitizeResult takes the value returned from config_dump json and cleans it up to remove special characters

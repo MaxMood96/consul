@@ -22,13 +22,98 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ResourceServiceClient interface {
+	// Read a resource by ID.
+	//
+	// By default, reads are eventually consistent, but you can opt-in to strong
+	// consistency via the x-consul-consistency-mode metadata (see ResourceService
+	// docs for more info).
+	//
+	// Errors with NotFound if the resource is not found.
+	//
+	// Errors with InvalidArgument if the request fails validation or the resource
+	// is stored as a type with a different GroupVersion than was requested.
+	//
+	// Errors with PermissionDenied if the caller is not authorized to read
+	// the resource.
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
+	// Write a resource.
+	//
+	// To perform a CAS (Compare-And-Swap) write, provide the current resource
+	// version in the Resource.Version field. If the given version doesn't match
+	// what is currently stored, an Aborted error code will be returned.
+	//
+	// To perform a blanket write (update regardless of the stored version),
+	// provide an empty Version in the Resource.Version field. Note that the
+	// write may still fail due to not being able to internally do a CAS write
+	// and return an Aborted error code.
+	//
+	// Resource.Id.Uid can (and by controllers, should) be provided to avoid
+	// accidentally modifying a resource if it has been deleted and recreated.
+	// If the given Uid doesn't match what is stored, a FailedPrecondition error
+	// code will be returned.
+	//
+	// It is not possible to modify the resource's status using Write. You must
+	// use WriteStatus instead.
 	Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
+	// WriteStatus updates one of the resource's statuses. It should only be used
+	// by controllers.
+	//
+	// To perform a CAS (Compare-And-Swap) write, provide the current resource
+	// version in the Version field. If the given version doesn't match what is
+	// currently stored, an Aborted error code will be returned.
+	//
+	// Note: in most cases, CAS status updates are not necessary because updates
+	// are scoped to a specific status key and controllers are leader-elected so
+	// there is no chance of a conflict.
+	//
+	// Id.Uid must be provided to avoid accidentally modifying a resource if it has
+	// been deleted and recreated. If the given Uid doesn't match what is stored,
+	// a FailedPrecondition error code will be returned.
 	WriteStatus(ctx context.Context, in *WriteStatusRequest, opts ...grpc.CallOption) (*WriteStatusResponse, error)
+	// List resources of a given type, tenancy, and optionally name prefix.
+	//
+	// To list resources across all tenancy units, provide the wildcard "*" value.
+	//
+	// Results are eventually consistent (see ResourceService docs for more info).
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
+	// List resources of a given owner.
+	//
+	// Results are eventually consistent (see ResourceService docs for more info).
+	ListByOwner(ctx context.Context, in *ListByOwnerRequest, opts ...grpc.CallOption) (*ListByOwnerResponse, error)
+	// Delete a resource by ID.
+	//
+	// Deleting a non-existent resource will return a successful response for
+	// idempotency.
+	//
+	// To perform a CAS (Compare-And-Swap) deletion, provide the current resource
+	// version in the Version field. If the given version doesn't match what is
+	// currently stored, an Aborted error code will be returned.
+	//
+	// Resource.Id.Uid can (and by controllers, should) be provided to avoid
+	// accidentally modifying a resource if it has been deleted and recreated.
+	// If the given Uid doesn't match what is stored, a FailedPrecondition error
+	// code will be returned.
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	// WatchList watches resources of the given type, tenancy, and optionally name
+	// prefix. It returns results for the current state-of-the-world at the start
+	// of the stream, and delta events whenever resources are written or deleted.
+	//
+	// To watch resources across all tenancy units, provide the wildcard "*" value.
+	//
+	// WatchList makes no guarantees about event timeliness (e.g. an event for a
+	// write may not be received immediately), but it does guarantee that events
+	// will be emitted in the correct order. See ResourceService docs for more
+	// info about consistency guarentees.
+	//
 	// buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
 	WatchList(ctx context.Context, in *WatchListRequest, opts ...grpc.CallOption) (ResourceService_WatchListClient, error)
+	// MutateAndValidate a resource.
+	//
+	// Applies a resource type's registered mutation and validation hooks to
+	// a resource. This is useful for filling in defaults and validating inputs before
+	// doing a Write. It's not a pre-requisite since the Write endpoint will also apply
+	// the hooks.
+	MutateAndValidate(ctx context.Context, in *MutateAndValidateRequest, opts ...grpc.CallOption) (*MutateAndValidateResponse, error)
 }
 
 type resourceServiceClient struct {
@@ -69,6 +154,15 @@ func (c *resourceServiceClient) WriteStatus(ctx context.Context, in *WriteStatus
 func (c *resourceServiceClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error) {
 	out := new(ListResponse)
 	err := c.cc.Invoke(ctx, "/hashicorp.consul.resource.ResourceService/List", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *resourceServiceClient) ListByOwner(ctx context.Context, in *ListByOwnerRequest, opts ...grpc.CallOption) (*ListByOwnerResponse, error) {
+	out := new(ListByOwnerResponse)
+	err := c.cc.Invoke(ctx, "/hashicorp.consul.resource.ResourceService/ListByOwner", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,17 +210,111 @@ func (x *resourceServiceWatchListClient) Recv() (*WatchEvent, error) {
 	return m, nil
 }
 
+func (c *resourceServiceClient) MutateAndValidate(ctx context.Context, in *MutateAndValidateRequest, opts ...grpc.CallOption) (*MutateAndValidateResponse, error) {
+	out := new(MutateAndValidateResponse)
+	err := c.cc.Invoke(ctx, "/hashicorp.consul.resource.ResourceService/MutateAndValidate", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ResourceServiceServer is the server API for ResourceService service.
 // All implementations should embed UnimplementedResourceServiceServer
 // for forward compatibility
 type ResourceServiceServer interface {
+	// Read a resource by ID.
+	//
+	// By default, reads are eventually consistent, but you can opt-in to strong
+	// consistency via the x-consul-consistency-mode metadata (see ResourceService
+	// docs for more info).
+	//
+	// Errors with NotFound if the resource is not found.
+	//
+	// Errors with InvalidArgument if the request fails validation or the resource
+	// is stored as a type with a different GroupVersion than was requested.
+	//
+	// Errors with PermissionDenied if the caller is not authorized to read
+	// the resource.
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
+	// Write a resource.
+	//
+	// To perform a CAS (Compare-And-Swap) write, provide the current resource
+	// version in the Resource.Version field. If the given version doesn't match
+	// what is currently stored, an Aborted error code will be returned.
+	//
+	// To perform a blanket write (update regardless of the stored version),
+	// provide an empty Version in the Resource.Version field. Note that the
+	// write may still fail due to not being able to internally do a CAS write
+	// and return an Aborted error code.
+	//
+	// Resource.Id.Uid can (and by controllers, should) be provided to avoid
+	// accidentally modifying a resource if it has been deleted and recreated.
+	// If the given Uid doesn't match what is stored, a FailedPrecondition error
+	// code will be returned.
+	//
+	// It is not possible to modify the resource's status using Write. You must
+	// use WriteStatus instead.
 	Write(context.Context, *WriteRequest) (*WriteResponse, error)
+	// WriteStatus updates one of the resource's statuses. It should only be used
+	// by controllers.
+	//
+	// To perform a CAS (Compare-And-Swap) write, provide the current resource
+	// version in the Version field. If the given version doesn't match what is
+	// currently stored, an Aborted error code will be returned.
+	//
+	// Note: in most cases, CAS status updates are not necessary because updates
+	// are scoped to a specific status key and controllers are leader-elected so
+	// there is no chance of a conflict.
+	//
+	// Id.Uid must be provided to avoid accidentally modifying a resource if it has
+	// been deleted and recreated. If the given Uid doesn't match what is stored,
+	// a FailedPrecondition error code will be returned.
 	WriteStatus(context.Context, *WriteStatusRequest) (*WriteStatusResponse, error)
+	// List resources of a given type, tenancy, and optionally name prefix.
+	//
+	// To list resources across all tenancy units, provide the wildcard "*" value.
+	//
+	// Results are eventually consistent (see ResourceService docs for more info).
 	List(context.Context, *ListRequest) (*ListResponse, error)
+	// List resources of a given owner.
+	//
+	// Results are eventually consistent (see ResourceService docs for more info).
+	ListByOwner(context.Context, *ListByOwnerRequest) (*ListByOwnerResponse, error)
+	// Delete a resource by ID.
+	//
+	// Deleting a non-existent resource will return a successful response for
+	// idempotency.
+	//
+	// To perform a CAS (Compare-And-Swap) deletion, provide the current resource
+	// version in the Version field. If the given version doesn't match what is
+	// currently stored, an Aborted error code will be returned.
+	//
+	// Resource.Id.Uid can (and by controllers, should) be provided to avoid
+	// accidentally modifying a resource if it has been deleted and recreated.
+	// If the given Uid doesn't match what is stored, a FailedPrecondition error
+	// code will be returned.
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	// WatchList watches resources of the given type, tenancy, and optionally name
+	// prefix. It returns results for the current state-of-the-world at the start
+	// of the stream, and delta events whenever resources are written or deleted.
+	//
+	// To watch resources across all tenancy units, provide the wildcard "*" value.
+	//
+	// WatchList makes no guarantees about event timeliness (e.g. an event for a
+	// write may not be received immediately), but it does guarantee that events
+	// will be emitted in the correct order. See ResourceService docs for more
+	// info about consistency guarentees.
+	//
 	// buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
 	WatchList(*WatchListRequest, ResourceService_WatchListServer) error
+	// MutateAndValidate a resource.
+	//
+	// Applies a resource type's registered mutation and validation hooks to
+	// a resource. This is useful for filling in defaults and validating inputs before
+	// doing a Write. It's not a pre-requisite since the Write endpoint will also apply
+	// the hooks.
+	MutateAndValidate(context.Context, *MutateAndValidateRequest) (*MutateAndValidateResponse, error)
 }
 
 // UnimplementedResourceServiceServer should be embedded to have forward compatible implementations.
@@ -145,11 +333,17 @@ func (UnimplementedResourceServiceServer) WriteStatus(context.Context, *WriteSta
 func (UnimplementedResourceServiceServer) List(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
 }
+func (UnimplementedResourceServiceServer) ListByOwner(context.Context, *ListByOwnerRequest) (*ListByOwnerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListByOwner not implemented")
+}
 func (UnimplementedResourceServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
 }
 func (UnimplementedResourceServiceServer) WatchList(*WatchListRequest, ResourceService_WatchListServer) error {
 	return status.Errorf(codes.Unimplemented, "method WatchList not implemented")
+}
+func (UnimplementedResourceServiceServer) MutateAndValidate(context.Context, *MutateAndValidateRequest) (*MutateAndValidateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MutateAndValidate not implemented")
 }
 
 // UnsafeResourceServiceServer may be embedded to opt out of forward compatibility for this service.
@@ -235,6 +429,24 @@ func _ResourceService_List_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ResourceService_ListByOwner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListByOwnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ResourceServiceServer).ListByOwner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/hashicorp.consul.resource.ResourceService/ListByOwner",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ResourceServiceServer).ListByOwner(ctx, req.(*ListByOwnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ResourceService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteRequest)
 	if err := dec(in); err != nil {
@@ -274,6 +486,24 @@ func (x *resourceServiceWatchListServer) Send(m *WatchEvent) error {
 	return x.ServerStream.SendMsg(m)
 }
 
+func _ResourceService_MutateAndValidate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MutateAndValidateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ResourceServiceServer).MutateAndValidate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/hashicorp.consul.resource.ResourceService/MutateAndValidate",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ResourceServiceServer).MutateAndValidate(ctx, req.(*MutateAndValidateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ResourceService_ServiceDesc is the grpc.ServiceDesc for ResourceService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -298,8 +528,16 @@ var ResourceService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ResourceService_List_Handler,
 		},
 		{
+			MethodName: "ListByOwner",
+			Handler:    _ResourceService_ListByOwner_Handler,
+		},
+		{
 			MethodName: "Delete",
 			Handler:    _ResourceService_Delete_Handler,
+		},
+		{
+			MethodName: "MutateAndValidate",
+			Handler:    _ResourceService_MutateAndValidate_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

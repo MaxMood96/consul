@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package lib
 
@@ -40,6 +40,16 @@ func TestMapWalk(t *testing.T) {
 				"foo": []uint8("bar"),
 			},
 			unexpected: true,
+		},
+		// ensure we don't panic from trying to call reflect.Value.Type
+		// on a nil pointer
+		"nil pointer": {
+			input: map[string]interface{}{
+				"foo": nil,
+			},
+			expected: map[string]interface{}{
+				"foo": nil,
+			},
 		},
 		// ensure nested maps get processed correctly
 		"nested": {

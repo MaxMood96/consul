@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -8,16 +8,19 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/go-memdb"
-	"github.com/mitchellh/copystructure"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/lib/maps"
+	"github.com/hashicorp/consul/lib/stringslice"
 	"github.com/hashicorp/consul/types"
 )
 
@@ -915,7 +918,7 @@ func ensureServiceTxn(tx WriteTxn, idx uint64, node string, preserveIndexes bool
 		if err != nil {
 			return err
 		}
-		if supported {
+		if supported && sn.Name != "" {
 			psn := structs.PeeredServiceName{Peer: svc.PeerName, ServiceName: sn}
 			vip, err := assignServiceVirtualIP(tx, idx, psn)
 			if err != nil {
@@ -942,7 +945,7 @@ func ensureServiceTxn(tx WriteTxn, idx uint64, node string, preserveIndexes bool
 			}
 			if conf != nil {
 				termGatewayConf := conf.(*structs.TerminatingGatewayConfigEntry)
-				addrs, err := getTermGatewayVirtualIPs(tx, idx, termGatewayConf.Services, &svc.EnterpriseMeta)
+				addrs, err := getTermGatewayVirtualIPs(tx, idx, termGatewayConf.Services)
 				if err != nil {
 					return err
 				}
@@ -1090,7 +1093,112 @@ func assignServiceVirtualIP(tx WriteTxn, idx uint64, psn structs.PeeredServiceNa
 	return result.String(), nil
 }
 
+// AssignManualServiceVIPs attempts to associate a list of manual virtual IP addresses with a given service name.
+// Any IP addresses given will be removed from other services in the same partition. This is done to ensure
+// that a manual VIP can only exist once for a given partition.
+// This function returns:
+// - a bool indicating whether the given service exists.
+// - a list of service names that had ip addresses removed from them.
+// - an error indicating success or failure of the call.
+func (s *Store) AssignManualServiceVIPs(idx uint64, psn structs.PeeredServiceName, ips []string) (bool, []structs.PeeredServiceName, error) {
+	tx := s.db.WriteTxn(idx)
+	defer tx.Abort()
+
+	// First remove the given IPs from any existing services, to avoid duplicate assignments.
+	assignedIPs := map[string]struct{}{}
+	for _, ip := range ips {
+		assignedIPs[ip] = struct{}{}
+	}
+
+	txnNeedsCommit := false
+
+	modifiedEntries := make(map[structs.PeeredServiceName]struct{})
+	for ip := range assignedIPs {
+		entry, err := tx.First(tableServiceVirtualIPs, indexManualVIPs, psn.ServiceName.PartitionOrDefault(), ip)
+		if err != nil {
+			return false, nil, fmt.Errorf("failed service virtual IP lookup: %s", err)
+		}
+
+		if entry == nil {
+			continue
+		}
+
+		newEntry := entry.(ServiceVirtualIP)
+
+		var (
+			thisServiceName = newEntry.Service.ServiceName
+			thisPeer        = newEntry.Service.Peer
+		)
+
+		if thisServiceName.Matches(psn.ServiceName) && thisPeer == psn.Peer {
+			continue
+		}
+
+		// Rebuild this entry's list of manual IPs, removing any that are present
+		// in new list we're assigning.
+		var filteredIPs []string
+		for _, existingIP := range newEntry.ManualIPs {
+			if _, ok := assignedIPs[existingIP]; !ok {
+				filteredIPs = append(filteredIPs, existingIP)
+			}
+		}
+		sort.Strings(filteredIPs)
+
+		newEntry.ManualIPs = filteredIPs
+		newEntry.ModifyIndex = idx
+		if err := tx.Insert(tableServiceVirtualIPs, newEntry); err != nil {
+			return false, nil, fmt.Errorf("failed inserting service virtual IP entry: %s", err)
+		}
+		modifiedEntries[newEntry.Service] = struct{}{}
+
+		if err := updateVirtualIPMaxIndexes(tx, idx, thisServiceName.PartitionOrDefault(), thisPeer); err != nil {
+			return false, nil, err
+		}
+
+		txnNeedsCommit = true
+	}
+
+	entry, err := tx.First(tableServiceVirtualIPs, indexID, psn)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed service virtual IP lookup: %s", err)
+	}
+
+	if entry == nil {
+		return false, nil, nil
+	}
+
+	newEntry := entry.(ServiceVirtualIP)
+
+	// Check to see if the slice already contains the same ips.
+	if !stringslice.EqualMapKeys(newEntry.ManualIPs, assignedIPs) {
+		newEntry.ManualIPs = slices.Clone(ips)
+		newEntry.ModifyIndex = idx
+
+		sort.Strings(newEntry.ManualIPs)
+
+		if err := tx.Insert(tableServiceVirtualIPs, newEntry); err != nil {
+			return false, nil, fmt.Errorf("failed inserting service virtual IP entry: %s", err)
+		}
+		if err := updateVirtualIPMaxIndexes(tx, idx, psn.ServiceName.PartitionOrDefault(), psn.Peer); err != nil {
+			return false, nil, err
+		}
+		txnNeedsCommit = true
+	}
+
+	if txnNeedsCommit {
+		if err = tx.Commit(); err != nil {
+			return false, nil, err
+		}
+	}
+
+	return true, maps.SliceOfKeys(modifiedEntries), nil
+}
+
 func updateVirtualIPMaxIndexes(txn WriteTxn, idx uint64, partition, peerName string) error {
+	// update global max index (for snapshots)
+	if err := indexUpdateMaxTxn(txn, idx, tableServiceVirtualIPs); err != nil {
+		return fmt.Errorf("failed while updating index: %w", err)
+	}
 	// update per-partition max index
 	if err := indexUpdateMaxTxn(txn, idx, partitionedIndexEntryName(tableServiceVirtualIPs, partition)); err != nil {
 		return fmt.Errorf("failed while updating partitioned index: %w", err)
@@ -1143,7 +1251,7 @@ func terminatingGatewayVirtualIPsSupported(tx ReadTxn, ws memdb.WatchSet) (bool,
 }
 
 // Services returns all services along with a list of associated tags.
-func (s *Store) Services(ws memdb.WatchSet, entMeta *acl.EnterpriseMeta, peerName string) (uint64, []*structs.ServiceNode, error) {
+func (s *Store) Services(ws memdb.WatchSet, entMeta *acl.EnterpriseMeta, peerName string, joinServiceNodes bool) (uint64, structs.ServiceNodes, error) {
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
@@ -1160,6 +1268,13 @@ func (s *Store) Services(ws memdb.WatchSet, entMeta *acl.EnterpriseMeta, peerNam
 	var result []*structs.ServiceNode
 	for service := services.Next(); service != nil; service = services.Next() {
 		result = append(result, service.(*structs.ServiceNode))
+	}
+	if joinServiceNodes {
+		parsedResult, err := parseServiceNodes(tx, ws, result, entMeta, peerName)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed querying and parsing services :%s", err)
+		}
+		return idx, parsedResult, nil
 	}
 	return idx, result, nil
 }
@@ -1990,6 +2105,12 @@ func (s *Store) deleteServiceTxn(tx WriteTxn, idx uint64, nodeName, serviceID st
 			if err := cleanupKindServiceName(tx, idx, sn, structs.ServiceKindConnectEnabled); err != nil {
 				return fmt.Errorf("failed to cleanup connect-enabled service name: %v", err)
 			}
+			// we need to do this if the proxy is deleted after the service itself
+			// as the guard after this might not be 1-1 between proxy and service
+			// names.
+			if err := cleanupGatewayWildcards(tx, idx, sn, false); err != nil {
+				return fmt.Errorf("failed to clean up gateway-service associations for %q: %v", psn.String(), err)
+			}
 		}
 	}
 
@@ -2035,7 +2156,13 @@ func freeServiceVirtualIP(
 
 	// Don't deregister the virtual IP if at least one resolver/router/splitter config entry still
 	// references this service.
-	configEntryVIPKinds := []string{structs.ServiceResolver, structs.ServiceRouter, structs.ServiceSplitter}
+	configEntryVIPKinds := []string{
+		structs.ServiceResolver,
+		structs.ServiceRouter,
+		structs.ServiceSplitter,
+		structs.ServiceDefaults,
+		structs.ServiceIntentions,
+	}
 	for _, kind := range configEntryVIPKinds {
 		_, entry, err := configEntryTxn(tx, nil, kind, psn.ServiceName.Name, &psn.ServiceName.EnterpriseMeta)
 		if err != nil {
@@ -2969,11 +3096,53 @@ func (s *Store) VirtualIPForService(psn structs.PeeredServiceName) (string, erro
 		return "", nil
 	}
 
-	result, err := addIPOffset(startingVirtualIP, vip.(ServiceVirtualIP).IP)
+	return vip.(ServiceVirtualIP).IPWithOffset()
+}
+
+func (s *Store) ServiceVirtualIPs() (uint64, []ServiceVirtualIP, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	return servicesVirtualIPsTxn(tx, nil)
+}
+
+func servicesVirtualIPsTxn(tx ReadTxn, ws memdb.WatchSet) (uint64, []ServiceVirtualIP, error) {
+	iter, err := tx.Get(tableServiceVirtualIPs, indexID)
 	if err != nil {
-		return "", err
+		return 0, nil, err
 	}
-	return result.String(), nil
+	ws.Add(iter.WatchCh())
+
+	var vips []ServiceVirtualIP
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		vip := raw.(ServiceVirtualIP)
+		vips = append(vips, vip)
+	}
+
+	// Pull from the global one
+	idx := maxIndexWatchTxn(tx, nil, tableServiceVirtualIPs)
+
+	return idx, vips, nil
+}
+
+func (s *Store) ServiceManualVIPs(psn structs.PeeredServiceName) (*ServiceVirtualIP, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	return serviceVIPsTxn(tx, psn)
+}
+
+func serviceVIPsTxn(tx ReadTxn, psn structs.PeeredServiceName) (*ServiceVirtualIP, error) {
+	vip, err := tx.First(tableServiceVirtualIPs, indexID, psn)
+	if err != nil {
+		return nil, fmt.Errorf("failed service virtual IP lookup: %s", err)
+	}
+	if vip == nil {
+		return nil, nil
+	}
+
+	entry := vip.(ServiceVirtualIP)
+	return &entry, nil
 }
 
 // VirtualIPsForAllImportedServices returns a slice of ServiceVirtualIP for all
@@ -3328,6 +3497,13 @@ func parseNodes(tx ReadTxn, ws memdb.WatchSet, idx uint64,
 		ws.AddWithLimit(watchLimit, services.WatchCh(), allServicesCh)
 		for service := services.Next(); service != nil; service = services.Next() {
 			ns := service.(*structs.ServiceNode).ToNodeService()
+			// If version isn't defined in node meta, set it from the Consul service meta
+			if _, ok := dump.Meta[structs.MetaConsulVersion]; !ok && ns.ID == "consul" && ns.Meta["version"] != "" {
+				if dump.Meta == nil {
+					dump.Meta = make(map[string]string)
+				}
+				dump.Meta[structs.MetaConsulVersion] = ns.Meta["version"]
+			}
 			dump.Services = append(dump.Services, ns)
 		}
 
@@ -3415,7 +3591,7 @@ func updateGatewayServices(tx WriteTxn, idx uint64, conf structs.ConfigEntry, en
 	for _, svc := range gatewayServices {
 		// If the service is a wildcard we need to target all services within the namespace
 		if svc.Service.Name == structs.WildcardSpecifier {
-			if err := updateGatewayNamespace(tx, idx, svc, entMeta); err != nil {
+			if err := updateGatewayNamespace(tx, idx, svc, &svc.Service.EnterpriseMeta); err != nil {
 				return fmt.Errorf("failed to associate gateway %q with wildcard: %v", gateway.String(), err)
 			}
 			// Skip service-specific update below if there was a wildcard update
@@ -3443,11 +3619,10 @@ func getTermGatewayVirtualIPs(
 	tx WriteTxn,
 	idx uint64,
 	services []structs.LinkedService,
-	entMeta *acl.EnterpriseMeta,
 ) (map[string]structs.ServiceAddress, error) {
 	addrs := make(map[string]structs.ServiceAddress, len(services))
 	for _, s := range services {
-		sn := structs.ServiceName{Name: s.Name, EnterpriseMeta: *entMeta}
+		sn := structs.ServiceName{Name: s.Name, EnterpriseMeta: s.EnterpriseMeta}
 		// Terminating Gateways cannot route to services in peered clusters
 		psn := structs.PeeredServiceName{ServiceName: sn, Peer: structs.DefaultPeerKeyword}
 		vip, err := assignServiceVirtualIP(tx, idx, psn)
@@ -3464,7 +3639,7 @@ func getTermGatewayVirtualIPs(
 func updateTerminatingGatewayVirtualIPs(tx WriteTxn, idx uint64, conf *structs.TerminatingGatewayConfigEntry, entMeta *acl.EnterpriseMeta) error {
 	// Build the current map of services with virtual IPs for this gateway
 	services := conf.Services
-	addrs, err := getTermGatewayVirtualIPs(tx, idx, services, entMeta)
+	addrs, err := getTermGatewayVirtualIPs(tx, idx, services)
 	if err != nil {
 		return err
 	}
@@ -3615,14 +3790,15 @@ func terminatingConfigGatewayServices(
 			return false, nil, fmt.Errorf("failed to get gateway service kind for service %s: %v", svc.Name, err)
 		}
 		mapping := &structs.GatewayService{
-			Gateway:     gateway,
-			Service:     structs.NewServiceName(svc.Name, &svc.EnterpriseMeta),
-			GatewayKind: structs.ServiceKindTerminatingGateway,
-			KeyFile:     svc.KeyFile,
-			CertFile:    svc.CertFile,
-			CAFile:      svc.CAFile,
-			SNI:         svc.SNI,
-			ServiceKind: kind,
+			Gateway:         gateway,
+			Service:         structs.NewServiceName(svc.Name, &svc.EnterpriseMeta),
+			GatewayKind:     structs.ServiceKindTerminatingGateway,
+			KeyFile:         svc.KeyFile,
+			CertFile:        svc.CertFile,
+			CAFile:          svc.CAFile,
+			SNI:             svc.SNI,
+			ServiceKind:     kind,
+			AutoHostRewrite: !svc.DisableAutoHostRewrite,
 		}
 
 		gatewayServices = append(gatewayServices, mapping)
@@ -3687,6 +3863,9 @@ func updateGatewayNamespace(tx WriteTxn, idx uint64, service *structs.GatewaySer
 			continue
 		}
 		if service.GatewayKind == structs.ServiceKindTerminatingGateway && !hasNonConnectInstance {
+			continue
+		}
+		if service.GatewayKind == structs.ServiceKindAPIGateway && !hasConnectInstance {
 			continue
 		}
 
@@ -3843,7 +4022,7 @@ func updateGatewayService(tx WriteTxn, idx uint64, mapping *structs.GatewayServi
 }
 
 // checkWildcardForGatewaysAndUpdate checks whether a service matches a
-// wildcard definition in gateway config entries and if so adds it the the
+// wildcard definition in gateway config entries and if so adds it the
 // gateway-services table.
 func checkGatewayWildcardsAndUpdate(tx WriteTxn, idx uint64, svc *structs.ServiceName, ns *structs.NodeService, kind structs.GatewayServiceKind) error {
 	sn := structs.ServiceName{Name: structs.WildcardSpecifier, EnterpriseMeta: svc.EnterpriseMeta}
@@ -3891,7 +4070,7 @@ func checkGatewayWildcardsAndUpdate(tx WriteTxn, idx uint64, svc *structs.Servic
 }
 
 // checkGatewayAndUpdate checks whether a service matches a
-// wildcard definition in gateway config entries and if so adds it the the
+// wildcard definition in gateway config entries and if so adds it the
 // gateway-services table.
 func checkGatewayAndUpdate(tx WriteTxn, idx uint64, svc *structs.ServiceName, kind structs.GatewayServiceKind) error {
 	sn := structs.ServiceName{Name: svc.Name, EnterpriseMeta: svc.EnterpriseMeta}
@@ -4089,6 +4268,36 @@ func serviceGatewayNodes(tx ReadTxn, ws memdb.WatchSet, service string, kind str
 	return maxIdx, ret, nil
 }
 
+// metricsProtocolForAPIGateway determines the protocol that should be used when fetching metrics for an api gateway
+// Since api gateways may have listeners with different protocols, favor capturing all traffic by only returning HTTP
+// when all listeners are HTTP-like.
+func metricsProtocolForAPIGateway(tx ReadTxn, ws memdb.WatchSet, sn structs.ServiceName) (uint64, string, error) {
+	idx, conf, err := configEntryTxn(tx, ws, structs.APIGateway, sn.Name, &sn.EnterpriseMeta)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to get api-gateway config entry for %q: %v", sn.String(), err)
+	}
+	if conf == nil {
+		return 0, "", nil
+	}
+	entry, ok := conf.(*structs.APIGatewayConfigEntry)
+	if !ok {
+		return 0, "", fmt.Errorf("unexpected config entry type: %T", conf)
+	}
+	counts := make(map[string]int)
+	for _, l := range entry.Listeners {
+		if structs.IsProtocolHTTPLike(string(l.Protocol)) {
+			counts["http"] += 1
+		} else {
+			counts["tcp"] += 1
+		}
+	}
+	protocol := "tcp"
+	if counts["tcp"] == 0 && counts["http"] > 0 {
+		protocol = "http"
+	}
+	return idx, protocol, nil
+}
+
 // metricsProtocolForIngressGateway determines the protocol that should be used when fetching metrics for an ingress gateway
 // Since ingress gateways may have listeners with different protocols, favor capturing all traffic by only returning HTTP
 // when all listeners are HTTP-like.
@@ -4140,7 +4349,7 @@ func (s *Store) ServiceTopology(
 	ws memdb.WatchSet,
 	dc, service string,
 	kind structs.ServiceKind,
-	defaultAllow acl.EnforcementDecision,
+	defaultAllow bool,
 	entMeta *acl.EnterpriseMeta,
 ) (uint64, *structs.ServiceTopology, error) {
 	tx := s.db.ReadTxn()
@@ -4162,7 +4371,11 @@ func (s *Store) ServiceTopology(
 		if err != nil {
 			return 0, nil, fmt.Errorf("failed to fetch protocol for service %s: %v", sn.String(), err)
 		}
-
+	case structs.ServiceKindAPIGateway:
+		maxIdx, protocol, err = metricsProtocolForAPIGateway(tx, ws, sn)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed to fetch protocol for service %s: %v", sn.String(), err)
+		}
 	case structs.ServiceKindTypical:
 		maxIdx, protocol, err = protocolForService(tx, ws, sn)
 		if err != nil {
@@ -4220,9 +4433,21 @@ func (s *Store) ServiceTopology(
 		maxIdx = idx
 	}
 
-	var upstreamSources = make(map[string]string)
+	upstreamSources := make(map[string]string)
 	for _, un := range upstreamNames {
 		upstreamSources[un.String()] = structs.TopologySourceRegistration
+	}
+
+	if kind == structs.ServiceKind(structs.APIGateway) {
+		upstreamFromGW, err := upstreamServicesForGatewayTxn(tx, sn)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		for _, dn := range upstreamFromGW {
+			upstreamNames = append(upstreamNames, dn)
+			upstreamSources[dn.String()] = structs.TopologySourceRegistration
+		}
 	}
 
 	upstreamDecisions := make(map[string]structs.IntentionDecisionSummary)
@@ -4275,7 +4500,7 @@ func (s *Store) ServiceTopology(
 			Partition:        un.PartitionOrDefault(),
 			Intentions:       srcIntentions,
 			MatchType:        structs.IntentionMatchDestination,
-			DefaultDecision:  defaultAllow,
+			DefaultAllow:     defaultAllow,
 			AllowPermissions: false,
 		}
 		decision, err := s.IntentionDecision(opts)
@@ -4341,8 +4566,21 @@ func (s *Store) ServiceTopology(
 		maxIdx = idx
 	}
 
-	var downstreamSources = make(map[string]string)
+	downstreamSources := make(map[string]string)
 	for _, dn := range downstreamNames {
+		downstreamSources[dn.String()] = structs.TopologySourceRegistration
+	}
+
+	idx, downstreamGWs, err := s.downstreamGatewaysForServiceTxn(tx, sn)
+	if err != nil {
+		return 0, nil, err
+	}
+	if idx > maxIdx {
+		maxIdx = idx
+	}
+
+	for _, dn := range downstreamGWs {
+		downstreamNames = append(downstreamNames, dn)
 		downstreamSources[dn.String()] = structs.TopologySourceRegistration
 	}
 
@@ -4386,7 +4624,7 @@ func (s *Store) ServiceTopology(
 			Partition:        dn.PartitionOrDefault(),
 			Intentions:       dstIntentions,
 			MatchType:        structs.IntentionMatchSource,
-			DefaultDecision:  defaultAllow,
+			DefaultAllow:     defaultAllow,
 			AllowPermissions: false,
 		}
 		decision, err := s.IntentionDecision(opts)
@@ -4406,13 +4644,17 @@ func (s *Store) ServiceTopology(
 		maxIdx = idx
 	}
 
-	// Store downstreams with at least one instance in transparent proxy mode.
+	// Store downstreams with at least one instance in transparent proxy or connect native mode.
 	// This is to avoid returning downstreams from intentions when none of the downstreams are transparent proxies.
-	tproxyMap := make(map[structs.ServiceName]struct{})
+	proxyMap := make(map[structs.ServiceName]struct{})
 	for _, downstream := range unfilteredDownstreams {
 		if downstream.Service.Proxy.Mode == structs.ProxyModeTransparent {
 			sn := structs.NewServiceName(downstream.Service.Proxy.DestinationServiceName, &downstream.Service.EnterpriseMeta)
-			tproxyMap[sn] = struct{}{}
+			proxyMap[sn] = struct{}{}
+		}
+		if downstream.Service.Connect.Native {
+			sn := downstream.Service.CompoundServiceName()
+			proxyMap[sn] = struct{}{}
 		}
 	}
 
@@ -4422,7 +4664,7 @@ func (s *Store) ServiceTopology(
 		if downstream.Service.Kind == structs.ServiceKindConnectProxy {
 			sn = structs.NewServiceName(downstream.Service.Proxy.DestinationServiceName, &downstream.Service.EnterpriseMeta)
 		}
-		if _, ok := tproxyMap[sn]; !ok && !downstream.Service.Connect.Native && downstreamSources[sn.String()] != structs.TopologySourceRegistration {
+		if _, ok := proxyMap[sn]; !ok && downstreamSources[sn.String()] != structs.TopologySourceRegistration {
 			// If downstream is not a transparent proxy or connect native, remove references
 			delete(downstreamSources, sn.String())
 			delete(downstreamDecisions, sn.String())
@@ -4451,6 +4693,7 @@ func (s *Store) combinedServiceNodesTxn(tx ReadTxn, ws memdb.WatchSet, names []s
 		maxIdx uint64
 		resp   structs.CheckServiceNodes
 	)
+	dedupMap := make(map[string]structs.CheckServiceNode)
 	for _, u := range names {
 		// Collect typical then connect instances
 		idx, csn, err := checkServiceNodesTxn(tx, ws, u.Name, false, &u.EnterpriseMeta, peerName)
@@ -4460,7 +4703,9 @@ func (s *Store) combinedServiceNodesTxn(tx ReadTxn, ws memdb.WatchSet, names []s
 		if idx > maxIdx {
 			maxIdx = idx
 		}
-		resp = append(resp, csn...)
+		for _, item := range csn {
+			dedupMap[item.Node.Node+"/"+item.Service.ID] = item
+		}
 
 		idx, csn, err = checkServiceNodesTxn(tx, ws, u.Name, true, &u.EnterpriseMeta, peerName)
 		if err != nil {
@@ -4469,9 +4714,69 @@ func (s *Store) combinedServiceNodesTxn(tx ReadTxn, ws memdb.WatchSet, names []s
 		if idx > maxIdx {
 			maxIdx = idx
 		}
-		resp = append(resp, csn...)
+		for _, item := range csn {
+			dedupMap[item.Node.Node+"/"+item.Service.ID] = item
+		}
+	}
+	for _, item := range dedupMap {
+		resp = append(resp, item)
 	}
 	return maxIdx, resp, nil
+}
+
+func upstreamServicesForGatewayTxn(tx ReadTxn, service structs.ServiceName) ([]structs.ServiceName, error) {
+	val, err := tx.First(tableConfigEntries, indexID, configentry.KindName{Kind: structs.BoundAPIGateway, Name: service.Name})
+	if err != nil {
+		return nil, err
+	}
+
+	if gw, ok := val.(*structs.BoundAPIGatewayConfigEntry); ok {
+		serviceIDs := gw.ListRelatedServices()
+		names := make([]structs.ServiceName, 0, len(serviceIDs))
+		for _, id := range serviceIDs {
+			names = append(names, structs.NewServiceName(id.ID, &id.EnterpriseMeta))
+		}
+		return names, nil
+	}
+
+	return nil, errors.New("not an APIGateway")
+}
+
+// downstreamsForServiceTxn will find all downstream services that could route traffic to the input service.
+// There are two factors at play. Upstreams defined in a proxy registration, and the discovery chain for those upstreams.
+func (s *Store) downstreamGatewaysForServiceTxn(tx ReadTxn, service structs.ServiceName) (uint64, []structs.ServiceName, error) {
+	iter, err := tx.Get(tableConfigEntries, indexLink, service.ToServiceID())
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var (
+		idx  uint64
+		resp []structs.ServiceName
+		seen = make(map[structs.ServiceName]struct{})
+	)
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		entry, ok := raw.(*structs.BoundAPIGatewayConfigEntry)
+		if !ok {
+			continue
+		}
+
+		if entry.ModifyIndex > idx {
+			idx = entry.ModifyIndex
+		}
+
+		gwServiceName := structs.NewServiceName(entry.Name, &entry.EnterpriseMeta)
+		if _, ok := seen[gwServiceName]; ok {
+			continue
+		}
+
+		seen[gwServiceName] = struct{}{}
+
+		resp = append(resp, gwServiceName)
+
+	}
+
+	return idx, resp, nil
 }
 
 // downstreamsForServiceTxn will find all downstream services that could route traffic to the input service.
@@ -4595,14 +4900,7 @@ func updateMeshTopology(tx WriteTxn, idx uint64, node string, svc *structs.NodeS
 
 		var mapping *upstreamDownstream
 		if existing, ok := obj.(*upstreamDownstream); ok {
-			rawCopy, err := copystructure.Copy(existing)
-			if err != nil {
-				return fmt.Errorf("failed to copy existing topology mapping: %v", err)
-			}
-			mapping, ok = rawCopy.(*upstreamDownstream)
-			if !ok {
-				return fmt.Errorf("unexpected topology type %T", rawCopy)
-			}
+			mapping := existing.DeepCopy()
 			mapping.Refs[uid] = struct{}{}
 			mapping.ModifyIndex = idx
 
@@ -4668,14 +4966,7 @@ func cleanupMeshTopology(tx WriteTxn, idx uint64, service *structs.ServiceNode) 
 
 	// Do the updates in a separate loop so we don't trash the iterator.
 	for _, m := range mappings {
-		rawCopy, err := copystructure.Copy(m)
-		if err != nil {
-			return fmt.Errorf("failed to copy existing topology mapping: %v", err)
-		}
-		copy, ok := rawCopy.(*upstreamDownstream)
-		if !ok {
-			return fmt.Errorf("unexpected topology type %T", rawCopy)
-		}
+		copy := m.DeepCopy()
 
 		// Bail early if there's no reference to the proxy ID we're deleting
 		if _, ok := copy.Refs[uid]; !ok {

@@ -1,15 +1,14 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package lua
 
 import (
 	"errors"
 	"fmt"
+	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
-	envoy_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	envoy_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_lua_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	envoy_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_resource_v3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -22,6 +21,8 @@ import (
 var _ extensioncommon.BasicExtension = (*lua)(nil)
 
 type lua struct {
+	extensioncommon.BasicExtensionAdapter
+
 	ProxyType string
 	Listener  string
 	Script    string
@@ -45,6 +46,9 @@ func (l *lua) fromArguments(args map[string]interface{}) error {
 	if err := mapstructure.Decode(args, l); err != nil {
 		return fmt.Errorf("error decoding extension arguments: %v", err)
 	}
+	if l.ProxyType == "" {
+		l.ProxyType = string(api.ServiceKindConnectProxy)
+	}
 	return l.validate()
 }
 
@@ -53,7 +57,7 @@ func (l *lua) validate() error {
 	if l.Script == "" {
 		resultErr = multierror.Append(resultErr, fmt.Errorf("missing Script value"))
 	}
-	if l.ProxyType != "connect-proxy" {
+	if l.ProxyType != string(api.ServiceKindConnectProxy) {
 		resultErr = multierror.Append(resultErr, fmt.Errorf("unexpected ProxyType %q", l.ProxyType))
 	}
 	if l.Listener != "inbound" && l.Listener != "outbound" {
@@ -64,25 +68,22 @@ func (l *lua) validate() error {
 
 // CanApply determines if the extension can apply to the given extension configuration.
 func (l *lua) CanApply(config *extensioncommon.RuntimeConfig) bool {
-	return string(config.Kind) == l.ProxyType && l.matchesListenerDirection(config)
+	return string(config.Kind) == l.ProxyType
 }
 
-func (l *lua) matchesListenerDirection(config *extensioncommon.RuntimeConfig) bool {
-	return (config.IsUpstream() && l.Listener == "outbound") || (!config.IsUpstream() && l.Listener == "inbound")
-}
-
-// PatchRoute does nothing.
-func (l *lua) PatchRoute(_ *extensioncommon.RuntimeConfig, route *envoy_route_v3.RouteConfiguration) (*envoy_route_v3.RouteConfiguration, bool, error) {
-	return route, false, nil
-}
-
-// PatchCluster does nothing.
-func (l *lua) PatchCluster(_ *extensioncommon.RuntimeConfig, c *envoy_cluster_v3.Cluster) (*envoy_cluster_v3.Cluster, bool, error) {
-	return c, false, nil
+func (l *lua) matchesListenerDirection(p extensioncommon.FilterPayload) bool {
+	isInboundListener := p.IsInbound()
+	return (!isInboundListener && l.Listener == "outbound") || (isInboundListener && l.Listener == "inbound")
 }
 
 // PatchFilter inserts a lua filter directly prior to envoy.filters.http.router.
-func (l *lua) PatchFilter(_ *extensioncommon.RuntimeConfig, filter *envoy_listener_v3.Filter) (*envoy_listener_v3.Filter, bool, error) {
+func (l *lua) PatchFilter(p extensioncommon.FilterPayload) (*envoy_listener_v3.Filter, bool, error) {
+	filter := p.Message
+	// Make sure filter matches extension config.
+	if !l.matchesListenerDirection(p) {
+		return filter, false, nil
+	}
+
 	if filter.Name != "envoy.filters.network.http_connection_manager" {
 		return filter, false, nil
 	}
@@ -97,7 +98,11 @@ func (l *lua) PatchFilter(_ *extensioncommon.RuntimeConfig, filter *envoy_listen
 	luaHttpFilter, err := extensioncommon.MakeEnvoyHTTPFilter(
 		"envoy.filters.http.lua",
 		&envoy_lua_v3.Lua{
-			InlineCode: l.Script,
+			DefaultSourceCode: &envoy_core_v3.DataSource{
+				Specifier: &envoy_core_v3.DataSource_InlineString{
+					InlineString: l.Script,
+				},
+			},
 		},
 	)
 	if err != nil {

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 
 set -euo pipefail
@@ -102,7 +102,8 @@ function verify_rpm {
     ${docker_image} \
     /scripts/verify_rpm.sh \
     "/workdir/${artifact_path}" \
-    "${expect_version}"
+    "${expect_version}" \
+    "${docker_image}"
 }
 
 # Arguments:

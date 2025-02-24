@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package dataplane
 
@@ -44,6 +44,6 @@ func NewServer(cfg Config) *Server {
 
 var _ pbdataplane.DataplaneServiceServer = (*Server)(nil)
 
-func (s *Server) Register(grpcServer *grpc.Server) {
-	pbdataplane.RegisterDataplaneServiceServer(grpcServer, s)
+func (s *Server) Register(registrar grpc.ServiceRegistrar) {
+	pbdataplane.RegisterDataplaneServiceServer(registrar, s)
 }

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -57,6 +57,10 @@ type CompiledDiscoveryChain struct {
 
 	// Targets is a list of all targets used in this chain.
 	Targets map[string]*DiscoveryTarget `json:",omitempty"`
+
+	// VirtualIPs is a list of virtual IPs associated with the service.
+	AutoVirtualIPs   []string
+	ManualVirtualIPs []string
 }
 
 // ID returns an ID that encodes the service, namespace, partition, and datacenter.
@@ -112,7 +116,7 @@ func (s *DiscoveryGraphNode) IsResolver() bool {
 }
 
 func (s *DiscoveryGraphNode) MapKey() string {
-	return fmt.Sprintf("%s:%s", s.Type, s.Name)
+	return s.Type + ":" + s.Name
 }
 
 // compiled form of ServiceResolverConfigEntry
@@ -186,6 +190,20 @@ type DiscoveryFailover struct {
 	Regions []string                       `json:",omitempty"`
 }
 
+// compiled form of ServiceResolverPrioritizeByLocality
+type DiscoveryPrioritizeByLocality struct {
+	Mode string `json:",omitempty"`
+}
+
+func (pbl *ServiceResolverPrioritizeByLocality) ToDiscovery() *DiscoveryPrioritizeByLocality {
+	if pbl == nil {
+		return nil
+	}
+	return &DiscoveryPrioritizeByLocality{
+		Mode: pbl.Mode,
+	}
+}
+
 // DiscoveryTarget represents all of the inputs necessary to use a resolver
 // config entry to execute a catalog query to generate a list of service
 // instances during discovery.
@@ -219,6 +237,8 @@ type DiscoveryTarget struct {
 	// balancer objects.  This has a structure similar to SNI, but will not be
 	// affected by SNI customizations.
 	Name string `json:",omitempty"`
+
+	PrioritizeByLocality *DiscoveryPrioritizeByLocality `json:",omitempty"`
 }
 
 func (t *DiscoveryTarget) MarshalJSON() ([]byte, error) {
@@ -258,12 +278,13 @@ func (t *DiscoveryTarget) UnmarshalJSON(data []byte) error {
 }
 
 type DiscoveryTargetOpts struct {
-	Service       string
-	ServiceSubset string
-	Namespace     string
-	Partition     string
-	Datacenter    string
-	Peer          string
+	Service              string
+	ServiceSubset        string
+	Namespace            string
+	Partition            string
+	Datacenter           string
+	Peer                 string
+	PrioritizeByLocality *DiscoveryPrioritizeByLocality
 }
 
 func MergeDiscoveryTargetOpts(opts ...DiscoveryTargetOpts) DiscoveryTargetOpts {

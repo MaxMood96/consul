@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package autoconf
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/connect"
+	"github.com/hashicorp/consul/agent/leafcert"
 	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib/retry"
@@ -102,6 +104,45 @@ func TestAutoEncrypt_generateCSR(t *testing.T) {
 			require.Equal(t, tcase.expectedDNSNames, request.DNSNames)
 			require.Equal(t, tcase.expectedIPs, request.IPAddresses)
 			require.Equal(t, tcase.expectedURIs, request.URIs)
+		})
+	}
+}
+
+func TestAutoEncrypt_generateCSR_RSA(t *testing.T) {
+	testCases := []struct {
+		name            string
+		keySize         int
+		expectedKeySize int
+	}{
+		{
+			name:            "DefaultKeySize",
+			keySize:         0,
+			expectedKeySize: 4096,
+		},
+		{
+			name:            "KeySize2048",
+			keySize:         2048,
+			expectedKeySize: 2048,
+		},
+	}
+
+	for _, tcase := range testCases {
+		t.Run(tcase.name, func(t *testing.T) {
+			ac := AutoConfig{config: &config.RuntimeConfig{
+				ConnectCAConfig: map[string]interface{}{
+					"PrivateKeyType": "rsa",
+					"PrivateKeyBits": tcase.keySize,
+				},
+			}}
+
+			// Generate a private RSA key.
+			_, key, err := ac.generateCSR()
+			require.NoError(t, err)
+
+			// Parse the private key and check it's length.
+			pemBlock, _ := pem.Decode([]byte(key))
+			priv, _ := x509.ParsePKCS1PrivateKey(pemBlock.Bytes)
+			require.Equal(t, tcase.expectedKeySize, priv.N.BitLen())
 		})
 	}
 }
@@ -347,10 +388,9 @@ func TestAutoEncrypt_TokenUpdate(t *testing.T) {
 	})
 
 	leafCtx, leafCancel := context.WithCancel(context.Background())
-	testAC.mcfg.cache.On("Notify",
+	testAC.mcfg.leafCerts.On("Notify",
 		mock.Anything,
-		cachetype.ConnectCALeafName,
-		&cachetype.ConnectCALeafRequest{
+		&leafcert.ConnectCALeafRequest{
 			Datacenter: "dc1",
 			Agent:      "autoconf",
 			Token:      newToken,
@@ -430,14 +470,14 @@ func TestAutoEncrypt_CertUpdate(t *testing.T) {
 		NotAfter: secondCert.ValidBefore,
 	}).Once()
 
-	req := cachetype.ConnectCALeafRequest{
+	req := leafcert.ConnectCALeafRequest{
 		Datacenter: "dc1",
 		Agent:      "autoconf",
 		Token:      testAC.originalToken,
 		DNSSAN:     defaultDNSSANs,
 		IPSAN:      defaultIPSANs,
 	}
-	require.True(t, testAC.mcfg.cache.sendNotification(context.Background(), req.CacheInfo().Key, cache.UpdateEvent{
+	require.True(t, testAC.mcfg.leafCerts.sendNotification(context.Background(), req.Key(), cache.UpdateEvent{
 		CorrelationID: leafWatchID,
 		Result:        secondCert,
 		Meta: cache.ResultMeta{
@@ -538,14 +578,14 @@ func TestAutoEncrypt_Fallback(t *testing.T) {
 
 	// now that all the mocks are set up we can trigger the whole thing by sending the second expired cert
 	// as a cache update event.
-	req := cachetype.ConnectCALeafRequest{
+	req := leafcert.ConnectCALeafRequest{
 		Datacenter: "dc1",
 		Agent:      "autoconf",
 		Token:      testAC.originalToken,
 		DNSSAN:     defaultDNSSANs,
 		IPSAN:      defaultIPSANs,
 	}
-	require.True(t, testAC.mcfg.cache.sendNotification(context.Background(), req.CacheInfo().Key, cache.UpdateEvent{
+	require.True(t, testAC.mcfg.leafCerts.sendNotification(context.Background(), req.Key(), cache.UpdateEvent{
 		CorrelationID: leafWatchID,
 		Result:        secondCert,
 		Meta: cache.ResultMeta{

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package config
 
@@ -25,13 +25,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
 
-	hcpconfig "github.com/hashicorp/consul/agent/hcp/config"
-
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/consul"
 	consulrate "github.com/hashicorp/consul/agent/consul/rate"
+	hcpconfig "github.com/hashicorp/consul/agent/hcp/config"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/lib"
@@ -47,6 +46,7 @@ type testCase struct {
 	desc             string
 	args             []string
 	setup            func() // TODO: accept a testing.T instead of panic
+	cleanup          func()
 	expected         func(rt *RuntimeConfig)
 	expectedErr      string
 	expectedWarnings []string
@@ -69,6 +69,9 @@ var defaultGrpcTlsAddr = net.TCPAddrFromAddrPort(netip.MustParseAddrPort("127.0.
 // checks for warnings on deprecated fields and flags.  These tests
 // should check one option at a time if possible
 func TestLoad_IntegrationWithFlags(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
 	dataDir := testutil.TempDir(t, "config")
 
 	run := func(t *testing.T, tc testCase) {
@@ -324,6 +327,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 			rt.DevMode = true
 			rt.DisableAnonymousSignature = true
 			rt.DisableKeyringFile = true
+			rt.Experiments = nil
 			rt.EnableDebug = true
 			rt.UIConfig.Enabled = true
 			rt.LeaveOnTerm = false
@@ -618,6 +622,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 			rt.NodeName = "a"
 			rt.TLS.NodeName = "a"
 			rt.DataDir = dataDir
+			rt.Cloud.NodeName = "a"
 		},
 	})
 	run(t, testCase{
@@ -629,6 +634,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 		expected: func(rt *RuntimeConfig) {
 			rt.NodeID = "a"
 			rt.DataDir = dataDir
+			rt.Cloud.NodeID = "a"
 		},
 	})
 	run(t, testCase{
@@ -1034,6 +1040,13 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 				return nil, fmt.Errorf("should not detect advertise_addr")
 			},
 		},
+	})
+	run(t, testCase{
+		desc:        "locality invalid",
+		args:        []string{`-data-dir=` + dataDir},
+		json:        []string{`{"locality": {"zone": "us-west-1a"}}`},
+		hcl:         []string{`locality { zone = "us-west-1a" }`},
+		expectedErr: "locality is invalid: zone cannot be set without region",
 	})
 	run(t, testCase{
 		desc: "client addr and ports == 0",
@@ -2302,6 +2315,77 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 		},
 	})
 	run(t, testCase{
+		desc: "cloud resource id from env",
+		args: []string{
+			`-server`,
+			`-data-dir=` + dataDir,
+		},
+		setup: func() {
+			os.Setenv("HCP_RESOURCE_ID", "env-id")
+		},
+		cleanup: func() {
+			os.Unsetenv("HCP_RESOURCE_ID")
+		},
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+			rt.Cloud = hcpconfig.CloudConfig{
+				ResourceID: "env-id",
+				NodeName:   "thehostname",
+				NodeID:     "",
+			}
+
+			// server things
+			rt.ServerMode = true
+			rt.Telemetry.EnableHostMetrics = true
+			rt.TLS.ServerMode = true
+			rt.LeaveOnTerm = false
+			rt.SkipLeaveOnInt = true
+			rt.RPCConfig.EnableStreaming = true
+			rt.GRPCTLSPort = 8503
+			rt.GRPCTLSAddrs = []net.Addr{defaultGrpcTlsAddr}
+		},
+	})
+	run(t, testCase{
+		desc: "cloud resource id from file",
+		args: []string{
+			`-server`,
+			`-data-dir=` + dataDir,
+		},
+		setup: func() {
+			os.Setenv("HCP_RESOURCE_ID", "env-id")
+		},
+		cleanup: func() {
+			os.Unsetenv("HCP_RESOURCE_ID")
+		},
+		json: []string{`{
+			  "cloud": {
+              	"resource_id": "file-id"
+              }
+			}`},
+		hcl: []string{`
+			  cloud = {
+	            resource_id = "file-id"
+			  }
+			`},
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+			rt.Cloud = hcpconfig.CloudConfig{
+				ResourceID: "env-id",
+				NodeName:   "thehostname",
+			}
+
+			// server things
+			rt.ServerMode = true
+			rt.Telemetry.EnableHostMetrics = true
+			rt.TLS.ServerMode = true
+			rt.LeaveOnTerm = false
+			rt.SkipLeaveOnInt = true
+			rt.RPCConfig.EnableStreaming = true
+			rt.GRPCTLSPort = 8503
+			rt.GRPCTLSAddrs = []net.Addr{defaultGrpcTlsAddr}
+		},
+	})
+	run(t, testCase{
 		desc: "sidecar_service can't have ID",
 		args: []string{
 			`-data-dir=` + dataDir,
@@ -2442,6 +2526,60 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 		expected: func(rt *RuntimeConfig) {
 			rt.Checks = []*structs.CheckDefinition{
 				{Name: "a", GRPC: "localhost:12345/foo", GRPCUseTLS: true, OutputMaxSize: checks.DefaultBufSize, Interval: time.Second},
+			}
+			rt.DataDir = dataDir
+		},
+	})
+	run(t, testCase{
+		desc: "tcp check with tcp_use_tls set",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		json: []string{
+			`{ "check": { "name": "a", "tcp": "localhost:55555", "tcp_use_tls": true, "interval": "5s" } }`,
+		},
+		hcl: []string{
+			`check = { name = "a" tcp = "localhost:55555" tcp_use_tls = true interval = "5s" }`,
+		},
+		expected: func(rt *RuntimeConfig) {
+			rt.Checks = []*structs.CheckDefinition{
+				{Name: "a", TCP: "localhost:55555", TCPUseTLS: true, OutputMaxSize: checks.DefaultBufSize, Interval: 5 * time.Second},
+			}
+			rt.DataDir = dataDir
+		},
+	})
+	run(t, testCase{
+		desc: "tcp check with tcp_use_tls set to false",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		json: []string{
+			`{ "check": { "name": "a", "tcp": "localhost:55555", "tcp_use_tls": false, "interval": "5s" } }`,
+		},
+		hcl: []string{
+			`check = { name = "a" tcp = "localhost:55555" tcp_use_tls = false interval = "5s" }`,
+		},
+		expected: func(rt *RuntimeConfig) {
+			rt.Checks = []*structs.CheckDefinition{
+				{Name: "a", TCP: "localhost:55555", TCPUseTLS: false, OutputMaxSize: checks.DefaultBufSize, Interval: 5 * time.Second},
+			}
+			rt.DataDir = dataDir
+		},
+	})
+	run(t, testCase{
+		desc: "tcp check with tcp_use_tls not set",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		json: []string{
+			`{ "check": { "name": "a", "tcp": "localhost:55555", "interval": "5s" } }`,
+		},
+		hcl: []string{
+			`check = { name = "a" tcp = "localhost:55555" interval = "5s" }`,
+		},
+		expected: func(rt *RuntimeConfig) {
+			rt.Checks = []*structs.CheckDefinition{
+				{Name: "a", TCP: "localhost:55555", TCPUseTLS: false, OutputMaxSize: checks.DefaultBufSize, Interval: 5 * time.Second},
 			}
 			rt.DataDir = dataDir
 		},
@@ -2653,7 +2791,44 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 				}
 			}
 		`},
-		expectedErr: "verify_server_hostname is only valid in the tls.internal_rpc stanza",
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+			rt.TLS.InternalRPC.VerifyServerHostname = true
+			rt.TLS.InternalRPC.VerifyOutgoing = true
+		},
+	})
+	run(t, testCase{
+		desc: "verify_server_hostname in the defaults stanza and internal_rpc",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		hcl: []string{`
+			tls {
+				defaults {
+					verify_server_hostname = false
+				},
+				internal_rpc {
+					verify_server_hostname = true
+				}
+			}
+		`},
+		json: []string{`
+			{
+				"tls": {
+					"defaults": {
+						"verify_server_hostname": false
+					},
+					"internal_rpc": {
+						"verify_server_hostname": true
+					}
+				}
+			}
+		`},
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+			rt.TLS.InternalRPC.VerifyServerHostname = true
+			rt.TLS.InternalRPC.VerifyOutgoing = true
+		},
 	})
 	run(t, testCase{
 		desc: "verify_server_hostname in the grpc stanza",
@@ -2676,7 +2851,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 				}
 			}
 		`},
-		expectedErr: "verify_server_hostname is only valid in the tls.internal_rpc stanza",
+		expectedErr: "verify_server_hostname is only valid in the tls.defaults and tls.internal_rpc stanza",
 	})
 	run(t, testCase{
 		desc: "verify_server_hostname in the https stanza",
@@ -2699,7 +2874,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 				}
 			}
 		`},
-		expectedErr: "verify_server_hostname is only valid in the tls.internal_rpc stanza",
+		expectedErr: "verify_server_hostname is only valid in the tls.defaults and tls.internal_rpc stanza",
 	})
 	run(t, testCase{
 		desc: "translated keys",
@@ -5641,6 +5816,74 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 		},
 	})
 	run(t, testCase{
+		desc: "tls.defaults.verify_server_hostname implies tls.internal_rpc.verify_outgoing",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		json: []string{`
+			{
+				"tls": {
+					"defaults": {
+						"verify_server_hostname": true
+					}
+				}
+			}
+		`},
+		hcl: []string{`
+			tls {
+				defaults {
+					verify_server_hostname = true
+				}
+			}
+		`},
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+
+			rt.TLS.Domain = "consul."
+			rt.TLS.NodeName = "thehostname"
+
+			rt.TLS.InternalRPC.VerifyServerHostname = true
+			rt.TLS.InternalRPC.VerifyOutgoing = true
+		},
+	})
+	run(t, testCase{
+		desc: "tls.internal_rpc.verify_server_hostname overwrites tls.defaults.verify_server_hostname",
+		args: []string{
+			`-data-dir=` + dataDir,
+		},
+		json: []string{`
+			{
+				"tls": {
+					"defaults": {
+						"verify_server_hostname": false
+					},
+					"internal_rpc": {
+						"verify_server_hostname": true
+					}
+				}
+			}
+		`},
+		hcl: []string{`
+			tls {
+				defaults {
+					verify_server_hostname = false
+				},
+				internal_rpc {
+					verify_server_hostname = true
+				}
+			}
+		`},
+		expected: func(rt *RuntimeConfig) {
+			rt.DataDir = dataDir
+
+			rt.TLS.Domain = "consul."
+			rt.TLS.NodeName = "thehostname"
+
+			rt.TLS.InternalRPC.VerifyServerHostname = true
+			rt.TLS.InternalRPC.VerifyOutgoing = true
+		},
+	})
+	run(t, testCase{
 		desc: "tls.grpc.use_auto_cert defaults to false",
 		args: []string{
 			`-data-dir=` + dataDir,
@@ -5768,7 +6011,7 @@ func TestLoad_IntegrationWithFlags(t *testing.T) {
 		hcl:  []string{``},
 		expected: func(rt *RuntimeConfig) {
 			rt.DataDir = dataDir
-			rt.RaftLogStoreConfig.Backend = consul.LogStoreBackendBoltDB
+			rt.RaftLogStoreConfig.Backend = consul.LogStoreBackendDefault
 			rt.RaftLogStoreConfig.WAL.SegmentSize = 64 * 1024 * 1024
 		},
 	})
@@ -5964,7 +6207,13 @@ func (tc testCase) run(format string, dataDir string) func(t *testing.T) {
 		expected.ACLResolverSettings.NodeName = expected.NodeName
 		expected.ACLResolverSettings.EnterpriseMeta = *structs.NodeEnterpriseMetaInPartition(expected.PartitionOrDefault())
 
+		for i, e := range expected.ConfigEntryBootstrap {
+			e.SetHash(actual.ConfigEntryBootstrap[i].GetHash())
+		}
 		prototest.AssertDeepEqual(t, expected, actual, cmpopts.EquateEmpty())
+		if tc.cleanup != nil {
+			tc.cleanup()
+		}
 	}
 }
 
@@ -6096,6 +6345,7 @@ func TestLoad_FullConfig(t *testing.T) {
 				Body:                           "wSjTy7dg",
 				DisableRedirects:               true,
 				TCP:                            "RJQND605",
+				TCPUseTLS:                      false,
 				H2PING:                         "9N1cSb5B",
 				H2PingUseTLS:                   false,
 				OSService:                      "aAjE6m9Z",
@@ -6126,6 +6376,7 @@ func TestLoad_FullConfig(t *testing.T) {
 				DisableRedirects:               false,
 				OutputMaxSize:                  checks.DefaultBufSize,
 				TCP:                            "4jG5casb",
+				TCPUseTLS:                      false,
 				H2PING:                         "HCHU7gEb",
 				H2PingUseTLS:                   false,
 				OSService:                      "aqq95BhP",
@@ -6155,6 +6406,7 @@ func TestLoad_FullConfig(t *testing.T) {
 				DisableRedirects:               true,
 				OutputMaxSize:                  checks.DefaultBufSize,
 				TCP:                            "JY6fTTcw",
+				TCPUseTLS:                      false,
 				H2PING:                         "rQ8eyCSF",
 				H2PingUseTLS:                   false,
 				OSService:                      "aZaCAXww",
@@ -6243,6 +6495,8 @@ func TestLoad_FullConfig(t *testing.T) {
 			Hostname:     "DH4bh7aC",
 			AuthURL:      "332nCdR2",
 			ScadaAddress: "aoeusth232",
+			NodeID:       types.NodeID("AsUIlw99"),
+			NodeName:     "otlLxGaI",
 		},
 		DNSAddrs:                         []net.Addr{tcpAddr("93.95.95.81:7001"), udpAddr("93.95.95.81:7001")},
 		DNSARecordLimit:                  29907,
@@ -6282,6 +6536,7 @@ func TestLoad_FullConfig(t *testing.T) {
 		EnableRemoteScriptChecks:         true,
 		EnableLocalScriptChecks:          true,
 		EncryptKey:                       "A4wELWqH",
+		Experiments:                      []string{"foo"},
 		StaticRuntimeConfig: StaticRuntimeConfig{
 			EncryptVerifyIncoming: true,
 			EncryptVerifyOutgoing: true,
@@ -6291,6 +6546,8 @@ func TestLoad_FullConfig(t *testing.T) {
 		GRPCAddrs:             []net.Addr{tcpAddr("32.31.61.91:4881")},
 		GRPCTLSPort:           5201,
 		GRPCTLSAddrs:          []net.Addr{tcpAddr("23.14.88.19:5201")},
+		GRPCKeepaliveInterval: 33 * time.Second,
+		GRPCKeepaliveTimeout:  22 * time.Second,
 		HTTPAddrs:             []net.Addr{tcpAddr("83.39.91.39:7999")},
 		HTTPBlockEndpoints:    []string{"RBvAFcGD", "fWOWFznh"},
 		AllowWriteHTTPFrom:    []*net.IPNet{cidr("127.0.0.0/8"), cidr("22.33.44.55/32"), cidr("0.0.0.0/0")},
@@ -6305,6 +6562,10 @@ func TestLoad_FullConfig(t *testing.T) {
 		KVMaxValueSize:        1234567800,
 		LeaveDrainTime:        8265 * time.Second,
 		LeaveOnTerm:           true,
+		Locality: &Locality{
+			Region: strPtr("us-east-2"),
+			Zone:   strPtr("us-east-2b"),
+		},
 		Logging: logging.Config{
 			LogLevel:       "k1zo9Spt",
 			LogJSON:        true,
@@ -6333,6 +6594,7 @@ func TestLoad_FullConfig(t *testing.T) {
 		RaftSnapshotThreshold:   16384,
 		RaftSnapshotInterval:    30 * time.Second,
 		RaftTrailingLogs:        83749,
+		RaftPreVoteDisabled:     false,
 		ReconnectTimeoutLAN:     23739 * time.Second,
 		ReconnectTimeoutWAN:     26694 * time.Second,
 		RequestLimitsMode:       consulrate.ModePermissive,
@@ -6351,6 +6613,7 @@ func TestLoad_FullConfig(t *testing.T) {
 		SerfPortWAN:             8302,
 		ServerMode:              true,
 		ServerName:              "Oerr9n1G",
+		ServerRejoinAgeMax:      604800 * time.Second,
 		ServerPort:              3757,
 		Services: []*structs.ServiceDefinition{
 			{
@@ -6405,6 +6668,10 @@ func TestLoad_FullConfig(t *testing.T) {
 							Warning: 1,
 						},
 					},
+				},
+				Locality: &structs.Locality{
+					Region: "us-east-1",
+					Zone:   "us-east-1a",
 				},
 			},
 			{
@@ -6564,6 +6831,10 @@ func TestLoad_FullConfig(t *testing.T) {
 				Connect: &structs.ServiceConnect{
 					Native: true,
 				},
+				Locality: &structs.Locality{
+					Region: "us-west-1",
+					Zone:   "us-west-1a",
+				},
 				Checks: structs.CheckTypes{
 					&structs.CheckType{
 						CheckID:    "Zv99e9Ka",
@@ -6686,6 +6957,8 @@ func TestLoad_FullConfig(t *testing.T) {
 				Expiration: 15 * time.Second,
 				Name:       "ftO6DySn", // notice this is the same as the metrics prefix
 			},
+			EnableHostMetrics:             true,
+			DisablePerTenancyUsageMetrics: true,
 		},
 		TLS: tlsutil.Config{
 			InternalRPC: tlsutil.ProtocolConfig{
@@ -6834,6 +7107,9 @@ func TestLoad_FullConfig(t *testing.T) {
 				time.Date(2019, 11, 20, 5, 0, 0, 0, time.UTC)))
 			r, err := Load(opts)
 			require.NoError(t, err)
+			for i, e := range expected.ConfigEntryBootstrap {
+				e.SetHash(r.RuntimeConfig.ConfigEntryBootstrap[i].GetHash())
+			}
 			prototest.AssertDeepEqual(t, expected, r.RuntimeConfig)
 			require.ElementsMatch(t, expectedWarns, r.Warnings, "Warnings: %#v", r.Warnings)
 		})
@@ -7095,7 +7371,8 @@ func TestRuntimeConfig_Sanitize(t *testing.T) {
 				},
 			},
 		},
-		Locality: &Locality{Region: strPtr("us-west-1"), Zone: strPtr("us-west-1a")},
+		Locality:           &Locality{Region: strPtr("us-west-1"), Zone: strPtr("us-west-1a")},
+		ServerRejoinAgeMax: 24 * 7 * time.Hour,
 	}
 
 	b, err := json.MarshalIndent(rt.Sanitized(), "", "    ")

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package metadata
 
@@ -127,11 +127,6 @@ func IsConsulServer(m serf.Member) (bool, *Server) {
 		}
 	}
 
-	buildVersion, err := Build(&m)
-	if err != nil {
-		return false, nil
-	}
-
 	wanJoinPort := 0
 	wanJoinPortStr, ok := m.Tags["wan_join_port"]
 	if ok {
@@ -180,6 +175,11 @@ func IsConsulServer(m serf.Member) (bool, *Server) {
 
 	addr := &net.TCPAddr{IP: m.Addr, Port: port}
 
+	buildVersion, err := Build(&m)
+	if err != nil {
+		return false, nil
+	}
+
 	parts := &Server{
 		Name:                m.Name,
 		ShortName:           strings.TrimSuffix(m.Name, "."+datacenter),
@@ -220,4 +220,14 @@ func AddFeatureFlags(tags map[string]string, flags ...string) {
 	for _, flag := range flags {
 		tags[featureFlagPrefix+flag] = "1"
 	}
+}
+
+func GetIP(addr net.Addr) []byte {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return []byte(a.IP.String())
+	case *net.TCPAddr:
+		return []byte(a.IP.String())
+	}
+	return []byte{}
 }

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -382,7 +382,10 @@ func newClientWithGRPCPlumbing(t *testing.T, ops ...func(*Config)) (*Client, *re
 	}
 
 	resolverBuilder := resolver.NewServerResolverBuilder(newTestResolverConfig(t,
-		"client."+config.Datacenter+"."+string(config.NodeID)))
+		"client."+config.Datacenter+"."+string(config.NodeID),
+		config.Datacenter,
+		"client",
+	))
 
 	resolver.Register(resolverBuilder)
 	t.Cleanup(func() {

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -179,7 +179,7 @@ func TestClient_LANReap(t *testing.T) {
 	retry.Run(t, func(r *retry.R) {
 		require.Len(r, c1.LANMembersInAgentPartition(), 1)
 		server := c1.router.FindLANServer()
-		require.Nil(t, server)
+		require.Nil(r, server)
 	})
 }
 
@@ -504,14 +504,18 @@ func newClient(t *testing.T, config *Config) *Client {
 	return client
 }
 
-func newTestResolverConfig(t *testing.T, suffix string) resolver.Config {
+func newTestResolverConfig(t testutil.TestingTB, suffix string, dc, agentType string) resolver.Config {
 	n := t.Name()
 	s := strings.Replace(n, "/", "", -1)
 	s = strings.Replace(s, "_", "", -1)
-	return resolver.Config{Authority: strings.ToLower(s) + "-" + suffix}
+	return resolver.Config{
+		Datacenter: dc,
+		AgentType:  agentType,
+		Authority:  strings.ToLower(s) + "-" + suffix,
+	}
 }
 
-func newDefaultDeps(t *testing.T, c *Config) Deps {
+func newDefaultDeps(t testutil.TestingTB, c *Config) Deps {
 	t.Helper()
 
 	logger := hclog.NewInterceptLogger(&hclog.LoggerOptions{
@@ -523,7 +527,7 @@ func newDefaultDeps(t *testing.T, c *Config) Deps {
 	tls, err := tlsutil.NewConfigurator(c.TLSConfig, logger)
 	require.NoError(t, err, "failed to create tls configuration")
 
-	resolverBuilder := resolver.NewServerResolverBuilder(newTestResolverConfig(t, c.NodeName+"-"+c.Datacenter))
+	resolverBuilder := resolver.NewServerResolverBuilder(newTestResolverConfig(t, c.NodeName+"-"+c.Datacenter, c.Datacenter, "server"))
 	resolver.Register(resolverBuilder)
 	t.Cleanup(func() {
 		resolver.Deregister(resolverBuilder.Authority())
@@ -572,6 +576,7 @@ func newDefaultDeps(t *testing.T, c *Config) Deps {
 		GetNetRPCInterceptorFunc: middleware.GetNetRPCInterceptor,
 		EnterpriseDeps:           newDefaultDepsEnterprise(t, logger, c),
 		XDSStreamLimiter:         limiter.NewSessionLimiter(),
+		Registry:                 NewTypeRegistry(),
 	}
 }
 

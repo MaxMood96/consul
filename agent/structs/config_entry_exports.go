@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -20,8 +20,17 @@ type ExportedServicesConfigEntry struct {
 	Services []ExportedService `json:",omitempty"`
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ExportedServicesConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ExportedServicesConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 // ExportedService manages the exporting of a service in the local partition to
@@ -79,6 +88,11 @@ func (e *ExportedServicesConfigEntry) Normalize() error {
 	for i := range e.Services {
 		e.Services[i].Namespace = acl.NormalizeNamespace(e.Services[i].Namespace)
 	}
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 
 	return nil
 }

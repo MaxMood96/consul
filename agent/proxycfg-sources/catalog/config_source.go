@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package catalog
 
@@ -32,9 +32,12 @@ type ConfigSource struct {
 	shutdownCh chan struct{}
 }
 
+var _ Watcher = (*ConfigSource)(nil)
+
 type watch struct {
-	numWatchers int // guarded by ConfigSource.mu.
-	closeCh     chan chan struct{}
+	numWatchers    int // guarded by ConfigSource.mu.
+	stopSyncLoopCh chan struct{}
+	syncLoopDoneCh chan struct{}
 }
 
 // NewConfigSource creates a ConfigSource with the given configuration.
@@ -48,7 +51,7 @@ func NewConfigSource(cfg Config) *ConfigSource {
 
 // Watch wraps the underlying proxycfg.Manager and dynamically registers
 // services from the catalog with it when requested by the xDS server.
-func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, token string) (<-chan *proxycfg.ConfigSnapshot, limiter.SessionTerminatedChan, proxycfg.CancelFunc, error) {
+func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, token string) (<-chan *proxycfg.ConfigSnapshot, limiter.SessionTerminatedChan, proxycfg.SrcTerminatedChan, context.CancelFunc, error) {
 	// If the service is registered to the local agent, use the LocalConfigSource
 	// rather than trying to configure it from the catalog.
 	if nodeName == m.NodeName && m.LocalState.ServiceExists(serviceID) {
@@ -63,7 +66,7 @@ func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, token
 	// See: https://github.com/hashicorp/consul/issues/15753
 	session, err := m.SessionLimiter.BeginSession()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	proxyID := proxycfg.ProxyID{
@@ -75,6 +78,28 @@ func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, token
 	// Start the watch on the real proxycfg Manager.
 	snapCh, cancelWatch := m.Manager.Watch(proxyID)
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	w, ok := m.watches[proxyID]
+	if ok {
+		w.numWatchers++
+	} else {
+		w = &watch{
+			numWatchers:    1,
+			stopSyncLoopCh: make(chan struct{}),
+			syncLoopDoneCh: make(chan struct{}),
+		}
+		m.watches[proxyID] = w
+
+		if err := m.startSync(w.stopSyncLoopCh, w.syncLoopDoneCh, proxyID); err != nil {
+			delete(m.watches, proxyID)
+			cancelWatch()
+			session.End()
+			return nil, nil, nil, nil, err
+		}
+	}
+
 	// Wrap the cancelWatch function with our bookkeeping. m.mu must be held when calling.
 	var cancelOnce sync.Once
 	cancel := func() {
@@ -84,26 +109,7 @@ func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, token
 			session.End()
 		})
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	w, ok := m.watches[proxyID]
-	if ok {
-		w.numWatchers++
-	} else {
-		w = &watch{closeCh: make(chan chan struct{}), numWatchers: 1}
-		m.watches[proxyID] = w
-
-		if err := m.startSync(w.closeCh, proxyID); err != nil {
-			delete(m.watches, proxyID)
-			cancelWatch()
-			session.End()
-			return nil, nil, nil, err
-		}
-	}
-
-	return snapCh, session.Terminated(), cancel, nil
+	return snapCh, session.Terminated(), w.syncLoopDoneCh, cancel, nil
 }
 
 func (m *ConfigSource) Shutdown() {
@@ -118,7 +124,11 @@ func (m *ConfigSource) Shutdown() {
 //
 // If the first attempt to fetch and register the service fails, startSync
 // will return an error (and no goroutine will be started).
-func (m *ConfigSource) startSync(closeCh <-chan chan struct{}, proxyID proxycfg.ProxyID) error {
+func (m *ConfigSource) startSync(
+	stopSyncLoopCh <-chan struct{},
+	syncLoopDoneCh chan<- struct{},
+	proxyID proxycfg.ProxyID,
+) error {
 	logger := m.Logger.With(
 		"proxy_service_id", proxyID.ServiceID.String(),
 		"node", proxyID.NodeName,
@@ -166,7 +176,13 @@ func (m *ConfigSource) startSync(closeCh <-chan chan struct{}, proxyID proxycfg.
 	syncLoop := func(ws memdb.WatchSet) {
 		// Cancel the context on return to clean up the goroutine started by WatchCh.
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		defer func() {
+			cancel()
+			logger.Debug("de-registering service with proxycfg manager because all watchers have gone away")
+			m.Manager.Deregister(proxyID, source)
+			close(syncLoopDoneCh)
+			logger.Debug("sync-loop terminated")
+		}()
 
 		for {
 			select {
@@ -175,16 +191,13 @@ func (m *ConfigSource) startSync(closeCh <-chan chan struct{}, proxyID proxycfg.
 				//
 				// It is expected that all other branches of this select will return and
 				// cancel the context given to WatchCh (to clean up its goroutine).
-			case doneCh := <-closeCh:
+			case <-stopSyncLoopCh:
 				// All watchers of this service (xDS streams) have gone away, so it's time
 				// to free its resources.
 				//
 				// TODO(agentless): we should probably wait for a short grace period before
 				// de-registering the service to allow clients to reconnect after a network
 				// blip.
-				logger.Trace("de-registering service with proxycfg manager because all watchers have gone away")
-				m.Manager.Deregister(proxyID, source)
-				close(doneCh)
 				return
 			case <-m.shutdownCh:
 				// Manager is shutting down, stop the goroutine.
@@ -194,6 +207,7 @@ func (m *ConfigSource) startSync(closeCh <-chan chan struct{}, proxyID proxycfg.
 			var err error
 			ws, err = fetchAndRegister()
 			if err != nil {
+				logger.Debug("error in syncLoop.fetchAndRegister", "err", err)
 				return
 			}
 		}
@@ -229,18 +243,14 @@ func (m *ConfigSource) cleanup(id proxycfg.ProxyID) {
 	h.numWatchers--
 
 	if h.numWatchers == 0 {
-		// We wait for doneCh to be closed by the sync goroutine, so that the lock is
+		// Notify the sync loop that it should terminate.
+		close(h.stopSyncLoopCh)
+		// We wait for sync loop to be closed, so that the lock is
 		// held until after the service is de-registered - this prevents a potential
 		// race where another sync goroutine is started for the service and we undo
 		// its call to register the service.
-		//
-		// This cannot deadlock because closeCh is unbuffered. Sending will only
-		// succeed if the sync goroutine is ready to receive (which always closes
-		// doneCh).
-		doneCh := make(chan struct{})
 		select {
-		case h.closeCh <- doneCh:
-			<-doneCh
+		case <-h.syncLoopDoneCh:
 		case <-m.shutdownCh:
 			// ConfigSource is shutting down, so the goroutine will be stopped anyway.
 		}
@@ -276,7 +286,7 @@ type Config struct {
 
 //go:generate mockery --name ConfigManager --inpackage
 type ConfigManager interface {
-	Watch(req proxycfg.ProxyID) (<-chan *proxycfg.ConfigSnapshot, proxycfg.CancelFunc)
+	Watch(req proxycfg.ProxyID) (<-chan *proxycfg.ConfigSnapshot, context.CancelFunc)
 	Register(proxyID proxycfg.ProxyID, service *structs.NodeService, source proxycfg.ProxySource, token string, overwrite bool) error
 	Deregister(proxyID proxycfg.ProxyID, source proxycfg.ProxySource)
 }
@@ -289,10 +299,11 @@ type Store interface {
 
 //go:generate mockery --name Watcher --inpackage
 type Watcher interface {
-	Watch(proxyID structs.ServiceID, nodeName string, token string) (<-chan *proxycfg.ConfigSnapshot, limiter.SessionTerminatedChan, proxycfg.CancelFunc, error)
+	Watch(proxyID structs.ServiceID, nodeName string, token string) (<-chan *proxycfg.ConfigSnapshot, limiter.SessionTerminatedChan, proxycfg.SrcTerminatedChan, context.CancelFunc, error)
 }
 
 //go:generate mockery --name SessionLimiter --inpackage
 type SessionLimiter interface {
 	BeginSession() (limiter.Session, error)
+	Run(ctx context.Context)
 }

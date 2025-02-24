@@ -12,9 +12,11 @@
 
 ## Introduction
 
-The goal of upgrade tests is to ensure problem-free upgrades on supported upgrade paths. At any given time, Consul supports the latest minor release, and two older minor releases, e.g. 1.15, 1.14, and 1.13. Upgrades to any higher version are permitted, including skipping a minor version e.g. from 1.13 to 1.15.  
+The goal of upgrade tests is to ensure problem-free upgrades on supported upgrade paths.
+At any given time, Consul supports the latest minor release, and two older minor releases, e.g. 1.15, 1.14, and 1.13.
+Upgrades to any higher version are permitted, including skipping a minor version e.g. from 1.13 to 1.15.
 
-The upgrade tests also aims to highlight errors that may occur as users attempt to upgrade their current version to a newer version. 
+The upgrade tests also aim to highlight errors that may occur as users attempt to upgrade their current version to a newer version.
 
 ### How it works
 
@@ -26,7 +28,7 @@ and envoy sidecars are deployed.
 
 > Note that all consul agents and user workloads such as application services, mesh-gateway are running in docker containers.
 
-In general, each upgrade test has following steps:
+In general, each upgrade test has the following steps:
 1. Create a cluster with a specified number of server and client agents, then enable the feature to be tested. 
 2. Create some workload in the cluster, e.g., registering 2 services: static-server, static-client.
 Static-server is a simple http application and the upstream service of static-client.
@@ -35,7 +37,7 @@ connection between static client and server. Ensure that a connection cannot be 
 4. Upgrade Consul cluster to the `target-version` and restart the Envoy sidecars
 (we restart Envoy sidecar to ensure the upgraded Consul binary can read the state from
 the previous version and generate the correct Envoy configurations)
-5. Re-validate the client, server and sidecars to ensure the persisted data from the pervious
+5. Re-validate the client, server and sidecars to ensure the persisted data from the previous
 version can be accessed in the target version. Verify connection / disconnection
 (e.g., deny Action)  
 
@@ -49,6 +51,13 @@ To run the upgrade test, the following tools are required:
 
 ### Running Upgrade integration tests
 - run `make dev-docker`
+- build a consul-envoy container image
+  ```shell
+  cd test/integration/consul-container
+  docker build -t consul-envoy:latest-version \
+    --build-arg CONSUL_IMAGE=docker.mirror.hashicorp.services/consul:1.20.0-rc1  \
+    --build-arg ENVOY_VERSION=1.31.2  -f ./assets/Dockerfile-consul-envoy ./assets
+  ```
 - run the single test `go test -v -timeout 30m -run ^TestACL_Upgrade_Node_Token$ ./.../upgrade/`
 - run all upgrade tests `go test -v -timeout 30m -run ./.../upgrade`
 
@@ -65,13 +74,13 @@ this makes it hard to debug, when the test case creates many containers. To
 disable following container logs, run the test with `-follow-log false`.
 
 Below are the supported CLI options
-| Flags      | Default value | Description |
+| Flags               | Default value | Description |
 | -----------         | ----------- | ----------- |
-| --latest-image      | `consul` in OSS, `hashicorp/consulenterprise` in ENT    | Name of the Docker image to deploy initially.
-| --latest-version    | latest      | Tag of the Docker image to deploy initially.
-| --target-image      | `consul` in OSS, `hashicorp/consulenterprise` in ENT    | Name of the Docker image to upgrade to.
-| --target-version    | local     | Tag of the Docker image to upgrade to. `local` is the tag built by `make dev-docker` above.
-| -follow-log         |  true    | Emit all container logs. These can be noisy, so we recommend `--follow-log=false` for local development.
+| --latest-image      | `consul` in CE, `hashicorp/consulenterprise` in ENT   | Name of the Docker image to deploy initially.
+| --latest-version    | latest                                                | Tag of the Docker image to deploy initially.
+| --target-image      | `consul` in Ce, `hashicorp/consulenterprise` in ENT   | Name of the Docker image to upgrade to.
+| --target-version    | local                                                 | Tag of the Docker image to upgrade to. `local` is the tag built by `make dev-docker` above.
+| -follow-log         |  true                                                 | Emit all container logs. These can be noisy, so we recommend `--follow-log=false` for local development.
 
 
 ## Adding a new upgrade integration test

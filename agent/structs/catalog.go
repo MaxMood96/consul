@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -58,4 +58,16 @@ func (h *HealthSummary) Add(status string) {
 	case api.HealthCritical:
 		h.Critical++
 	}
+}
+
+type AssignServiceManualVIPsRequest struct {
+	Service    string
+	ManualVIPs []string
+
+	DCSpecificRequest
+}
+
+type AssignServiceManualVIPsResponse struct {
+	Found          bool
+	UnassignedFrom []PeeredServiceName
 }

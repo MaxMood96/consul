@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package state
 
@@ -13,15 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/acl"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/hashicorp/go-memdb"
-	"github.com/hashicorp/go-uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-uuid"
+
+	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib/stringslice"
@@ -1959,6 +1959,295 @@ func TestStateStore_EnsureService_VirtualIPAssign(t *testing.T) {
 	assert.Equal(t, ns5.Port, taggedAddress.Port)
 }
 
+func TestStateStore_AssignManualVirtualIPs(t *testing.T) {
+	s := testStateStore(t)
+	setVirtualIPFlags(t, s)
+
+	newPSN := func(name, peer string) structs.PeeredServiceName {
+		return structs.PeeredServiceName{
+			ServiceName: structs.ServiceName{
+				Name:           name,
+				EnterpriseMeta: *acl.DefaultEnterpriseMeta(),
+			},
+			Peer: peer,
+		}
+	}
+
+	checkMaxIndexes := func(t *testing.T, expect, expectImported uint64) {
+		t.Helper()
+		tx := s.db.Txn(false)
+		defer tx.Abort()
+
+		idx := maxIndexWatchTxn(tx, nil, tableServiceVirtualIPs)
+		require.Equal(t, expect, idx)
+
+		entMeta := acl.DefaultEnterpriseMeta()
+
+		importedIdx := maxIndexTxn(tx, partitionedIndexEntryName(tableServiceVirtualIPs+".imported", entMeta.PartitionOrDefault()))
+		require.Equal(t, expectImported, importedIdx)
+	}
+
+	assignManual := func(
+		t *testing.T,
+		idx uint64,
+		psn structs.PeeredServiceName,
+		ips []string,
+		modified ...structs.PeeredServiceName,
+	) {
+		t.Helper()
+		found, svcs, err := s.AssignManualServiceVIPs(idx, psn, ips)
+		require.NoError(t, err)
+		require.True(t, found)
+		if len(modified) == 0 {
+			require.Empty(t, svcs)
+		} else {
+			require.ElementsMatch(t, modified, svcs)
+		}
+	}
+
+	checkVIP := func(
+		t *testing.T,
+		psn structs.PeeredServiceName,
+		expectVIP string,
+	) {
+		t.Helper()
+		// Make sure there's a virtual IP for the foo service.
+		vip, err := s.VirtualIPForService(psn)
+		require.NoError(t, err)
+		assert.Equal(t, expectVIP, vip)
+	}
+
+	checkManualVIP := func(
+		t *testing.T,
+		psn structs.PeeredServiceName,
+		expectIP string,
+		expectManual []string,
+		expectIndex uint64,
+	) {
+		t.Helper()
+		serviceVIP, err := s.ServiceManualVIPs(psn)
+		require.NoError(t, err)
+		require.Equal(t, expectIP, serviceVIP.IP.String())
+		if len(expectManual) == 0 {
+			require.Empty(t, serviceVIP.ManualIPs)
+		} else {
+			require.Equal(t, expectManual, serviceVIP.ManualIPs)
+		}
+		require.Equal(t, expectIndex, serviceVIP.ModifyIndex)
+	}
+
+	psn := newPSN("foo", "")
+
+	lastIndex := uint64(0)
+	nextIndex := func() uint64 {
+		lastIndex++
+		return lastIndex
+	}
+
+	testutil.RunStep(t, "assign to nonexistent service is noop", func(t *testing.T) {
+		useIdx := nextIndex()
+
+		// Attempt to assign manual virtual IPs to a service that doesn't exist - should be a no-op.
+		found, svcs, err := s.AssignManualServiceVIPs(useIdx, psn, []string{"7.7.7.7", "8.8.8.8"})
+		require.NoError(t, err)
+		require.False(t, found)
+		require.Empty(t, svcs)
+
+		serviceVIP, err := s.ServiceManualVIPs(psn)
+		require.NoError(t, err)
+		require.Nil(t, serviceVIP)
+
+		checkMaxIndexes(t, 0, 0)
+	})
+
+	// Create the service registration.
+	var regIndex1 uint64
+	testutil.RunStep(t, "create service 1", func(t *testing.T) {
+		useIdx := nextIndex()
+		regIndex1 = useIdx
+
+		entMeta := acl.DefaultEnterpriseMeta()
+		ns1 := &structs.NodeService{
+			ID:             "foo",
+			Service:        "foo",
+			Address:        "1.1.1.1",
+			Port:           1111,
+			Connect:        structs.ServiceConnect{Native: true},
+			EnterpriseMeta: *entMeta,
+		}
+
+		// Service successfully registers into the state store.
+		testRegisterNode(t, s, useIdx, "node1")
+		require.NoError(t, s.EnsureService(useIdx, "node1", ns1))
+
+		// Make sure there's a virtual IP for the foo service.
+		checkVIP(t, psn, "240.0.0.1")
+
+		// No manual IP should be set yet.
+		checkManualVIP(t, psn, "0.0.0.1", []string{}, regIndex1)
+
+		checkMaxIndexes(t, regIndex1, 0)
+	})
+
+	// Attempt to assign manual virtual IPs again.
+	var assignIndex1 uint64
+	testutil.RunStep(t, "assign to existent service does something", func(t *testing.T) {
+		useIdx := nextIndex()
+		assignIndex1 = useIdx
+
+		// inserting in the wrong order to test the string sort
+		assignManual(t, useIdx, psn, []string{"7.7.7.7", "8.8.8.8", "6.6.6.6"})
+
+		checkManualVIP(t, psn, "0.0.0.1", []string{
+			"6.6.6.6", "7.7.7.7", "8.8.8.8",
+		}, assignIndex1)
+
+		checkMaxIndexes(t, assignIndex1, 0)
+	})
+
+	psn2 := newPSN("bar", "")
+
+	var regIndex2 uint64
+	testutil.RunStep(t, "create service 2", func(t *testing.T) {
+		useIdx := nextIndex()
+		regIndex2 = useIdx
+
+		// Register another service via config entry.
+		s.EnsureConfigEntry(useIdx, &structs.ServiceResolverConfigEntry{
+			Kind: structs.ServiceResolver,
+			Name: "bar",
+		})
+
+		checkVIP(t, psn2, "240.0.0.2")
+
+		// No manual IP should be set yet.
+		checkManualVIP(t, psn2, "0.0.0.2", []string{}, regIndex2)
+
+		checkMaxIndexes(t, regIndex2, 0)
+	})
+
+	// Attempt to assign manual virtual IPs for bar, with one IP overlapping with foo.
+	// This should cause the ip to be removed from foo's list of manual IPs.
+	var assignIndex2 uint64
+	testutil.RunStep(t, "assign to existent service and ip is removed from another", func(t *testing.T) {
+		useIdx := nextIndex()
+		assignIndex2 = useIdx
+
+		assignManual(t, useIdx, psn2, []string{"7.7.7.7", "9.9.9.9"}, psn)
+
+		checkManualVIP(t, psn, "0.0.0.1", []string{
+			"6.6.6.6", "8.8.8.8", // 7.7.7.7 was stolen by psn2
+		}, assignIndex2)
+		checkManualVIP(t, psn2, "0.0.0.2", []string{
+			"7.7.7.7", "9.9.9.9",
+		}, assignIndex2)
+
+		checkMaxIndexes(t, assignIndex2, 0)
+	})
+
+	psn3 := newPSN("gir", "peer1")
+
+	var regIndex3 uint64
+	testutil.RunStep(t, "create peered service 1", func(t *testing.T) {
+		useIdx := nextIndex()
+		regIndex3 = useIdx
+
+		// Create the service registration.
+		entMetaPeer := acl.DefaultEnterpriseMeta()
+		nsPeer1 := &structs.NodeService{
+			ID:             "gir",
+			Service:        "gir",
+			Address:        "9.9.9.9",
+			Port:           2222,
+			PeerName:       "peer1",
+			Connect:        structs.ServiceConnect{Native: true},
+			EnterpriseMeta: *entMetaPeer,
+		}
+
+		// Service successfully registers into the state store.
+		testRegisterPeering(t, s, useIdx, "peer1")
+		testRegisterNodeOpts(t, s, useIdx, "node9", func(n *structs.Node) error {
+			n.PeerName = "peer1"
+			return nil
+		})
+		require.NoError(t, s.EnsureService(useIdx, "node9", nsPeer1))
+
+		checkVIP(t, psn3, "240.0.0.3")
+
+		// No manual IP should be set yet.
+		checkManualVIP(t, psn3, "0.0.0.3", []string{}, regIndex3)
+
+		checkMaxIndexes(t, regIndex3, regIndex3)
+	})
+
+	// Assign manual virtual IPs to peered service.
+	var assignIndex3 uint64
+	testutil.RunStep(t, "assign to peered service and steal from non-peered", func(t *testing.T) {
+		useIdx := nextIndex()
+		assignIndex3 = useIdx
+
+		// 5.5.5.5 is stolen from psn
+		assignManual(t, useIdx, psn3, []string{"5.5.5.5", "6.6.6.6"}, psn)
+
+		checkManualVIP(t, psn, "0.0.0.1", []string{
+			"8.8.8.8", // 5.5.5.5 was stolen by psn3
+		}, assignIndex3)
+		checkManualVIP(t, psn2, "0.0.0.2", []string{
+			"7.7.7.7", "9.9.9.9",
+		}, assignIndex2)
+		checkManualVIP(t, psn3, "0.0.0.3", []string{
+			"5.5.5.5", "6.6.6.6",
+		}, assignIndex3)
+
+		checkMaxIndexes(t, assignIndex3, assignIndex3)
+	})
+
+	var assignIndex4 uint64
+	testutil.RunStep(t, "assign to non-peered service and steal from peered", func(t *testing.T) {
+		useIdx := nextIndex()
+		assignIndex4 = useIdx
+
+		// 6.6.6.6 is stolen from psn3
+		assignManual(t, useIdx, psn2, []string{
+			"7.7.7.7", "9.9.9.9", "6.6.6.6",
+		}, psn3)
+
+		checkManualVIP(t, psn, "0.0.0.1", []string{
+			"8.8.8.8", // 5.5.5.5 was stolen by psn3
+		}, assignIndex3)
+		checkManualVIP(t, psn2, "0.0.0.2", []string{
+			"6.6.6.6", "7.7.7.7", "9.9.9.9",
+		}, assignIndex4)
+		checkManualVIP(t, psn3, "0.0.0.3", []string{
+			"5.5.5.5",
+		}, assignIndex4)
+
+		checkMaxIndexes(t, assignIndex4, assignIndex4)
+	})
+
+	testutil.RunStep(t, "repeat the last write and no indexes should be bumped", func(t *testing.T) {
+		useIdx := nextIndex()
+
+		assignManual(t, useIdx, psn2, []string{
+			"7.7.7.7", "9.9.9.9", "6.6.6.6",
+		}) // no modified this time
+
+		// no changes
+		checkManualVIP(t, psn, "0.0.0.1", []string{
+			"8.8.8.8",
+		}, assignIndex3)
+		checkManualVIP(t, psn2, "0.0.0.2", []string{
+			"6.6.6.6", "7.7.7.7", "9.9.9.9",
+		}, assignIndex4)
+		checkManualVIP(t, psn3, "0.0.0.3", []string{
+			"5.5.5.5",
+		}, assignIndex4)
+
+		// no change
+		checkMaxIndexes(t, assignIndex4, assignIndex4)
+	})
+}
+
 func TestStateStore_EnsureService_ReassignFreedVIPs(t *testing.T) {
 	s := testStateStore(t)
 	setVirtualIPFlags(t, s)
@@ -2097,7 +2386,7 @@ func TestStateStore_Services(t *testing.T) {
 
 	// Listing with no results returns an empty list.
 	ws := memdb.NewWatchSet()
-	idx, services, err := s.Services(ws, nil, "")
+	idx, services, err := s.Services(ws, nil, "", false)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -2142,7 +2431,7 @@ func TestStateStore_Services(t *testing.T) {
 
 	// Pull all the services.
 	ws = memdb.NewWatchSet()
-	idx, services, err = s.Services(ws, nil, "")
+	idx, services, err = s.Services(ws, nil, "", false)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -2151,7 +2440,7 @@ func TestStateStore_Services(t *testing.T) {
 	}
 
 	// Verify the result.
-	expected := []*structs.ServiceNode{
+	expected := structs.ServiceNodes{
 		ns1Dogs.ToServiceNode("node1"),
 		ns1.ToServiceNode("node1"),
 		ns2.ToServiceNode("node2"),
@@ -4756,6 +5045,9 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 	}
 
 	// Register some nodes
+	// node1 is registered withOut any nodemeta, and a consul service with id
+	// 'consul' is added later with meta 'version'. The expected node must have
+	// meta 'consul-version' with same value
 	testRegisterNode(t, s, 0, "node1")
 	testRegisterNode(t, s, 1, "node2")
 
@@ -4764,6 +5056,8 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 	testRegisterService(t, s, 3, "node1", "service2")
 	testRegisterService(t, s, 4, "node2", "service1")
 	testRegisterService(t, s, 5, "node2", "service2")
+	// Register consul service with meta 'version' for node1
+	testRegisterServiceWithMeta(t, s, 10, "node1", "consul", map[string]string{"version": "1.17.0"})
 
 	// Register service-level checks
 	testRegisterCheck(t, s, 6, "node1", "service1", "check1", api.HealthPassing)
@@ -4814,6 +5108,19 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 			},
 			Services: []*structs.NodeService{
 				{
+					ID:      "consul",
+					Service: "consul",
+					Address: "1.1.1.1",
+					Meta:    map[string]string{"version": "1.17.0"},
+					Port:    1111,
+					Weights: &structs.Weights{Passing: 1, Warning: 1},
+					RaftIndex: structs.RaftIndex{
+						CreateIndex: 10,
+						ModifyIndex: 10,
+					},
+					EnterpriseMeta: *structs.DefaultEnterpriseMetaInDefaultPartition(),
+				},
+				{
 					ID:      "service1",
 					Service: "service1",
 					Address: "1.1.1.1",
@@ -4840,6 +5147,7 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 					EnterpriseMeta: *structs.DefaultEnterpriseMetaInDefaultPartition(),
 				},
 			},
+			Meta: map[string]string{"consul-version": "1.17.0"},
 		},
 		&structs.NodeInfo{
 			Node:      "node2",
@@ -4907,7 +5215,7 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if idx != 9 {
+	if idx != 10 {
 		t.Fatalf("bad index: %d", idx)
 	}
 	require.Len(t, dump, 1)
@@ -4918,8 +5226,8 @@ func TestStateStore_NodeInfo_NodeDump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if idx != 9 {
-		t.Fatalf("bad index: %d", 9)
+	if idx != 10 {
+		t.Fatalf("bad index: %d", idx)
 	}
 	if !reflect.DeepEqual(dump, expect) {
 		t.Fatalf("bad: %#v", dump[0].Services[0])
@@ -5097,7 +5405,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 21,
 				ModifyIndex: 21,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:     structs.NewServiceName("db", nil),
@@ -5107,7 +5416,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 21,
 				ModifyIndex: 21,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5141,7 +5451,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 21,
 				ModifyIndex: 21,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:     structs.NewServiceName("db", nil),
@@ -5151,7 +5462,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 21,
 				ModifyIndex: 21,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5202,7 +5514,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:     structs.NewServiceName("db", nil),
@@ -5212,7 +5525,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5240,7 +5554,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:     structs.NewServiceName("db", nil),
@@ -5250,7 +5565,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:      structs.NewServiceName("redis", nil),
@@ -5265,7 +5581,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 23,
 				ModifyIndex: 23,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5293,7 +5610,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 		{
 			Service:     structs.NewServiceName("db", nil),
@@ -5303,7 +5621,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 22,
 				ModifyIndex: 22,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5335,7 +5654,8 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 25,
 				ModifyIndex: 25,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5367,6 +5687,7 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 26,
 				ModifyIndex: 26,
 			},
+			AutoHostRewrite: true,
 		},
 		{
 			Service:      structs.NewServiceName("db", nil),
@@ -5377,6 +5698,7 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 26,
 				ModifyIndex: 26,
 			},
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5404,6 +5726,7 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 26,
 				ModifyIndex: 26,
 			},
+			AutoHostRewrite: true,
 		},
 		{
 			Service:      structs.NewServiceName("db", nil),
@@ -5414,6 +5737,7 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 26,
 				ModifyIndex: 26,
 			},
+			AutoHostRewrite: true,
 		},
 		{
 			Service:      structs.NewServiceName("destination1", nil),
@@ -5425,6 +5749,7 @@ func TestStateStore_GatewayServices_Terminating(t *testing.T) {
 				CreateIndex: 27,
 				ModifyIndex: 27,
 			},
+			AutoHostRewrite: true,
 		},
 	}
 	assert.ElementsMatch(t, expectWildcardIncludesDest, out)
@@ -5918,7 +6243,8 @@ func TestStateStore_GatewayServices_ServiceDeletion(t *testing.T) {
 				CreateIndex: 19,
 				ModifyIndex: 19,
 			},
-			ServiceKind: structs.GatewayServiceKindService,
+			ServiceKind:     structs.GatewayServiceKindService,
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5940,6 +6266,7 @@ func TestStateStore_GatewayServices_ServiceDeletion(t *testing.T) {
 				CreateIndex: 20,
 				ModifyIndex: 20,
 			},
+			AutoHostRewrite: true,
 		},
 		{
 			Service:      structs.NewServiceName("db", nil),
@@ -5950,6 +6277,7 @@ func TestStateStore_GatewayServices_ServiceDeletion(t *testing.T) {
 				CreateIndex: 20,
 				ModifyIndex: 20,
 			},
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5977,6 +6305,7 @@ func TestStateStore_GatewayServices_ServiceDeletion(t *testing.T) {
 				CreateIndex: 19,
 				ModifyIndex: 20,
 			},
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -5997,6 +6326,7 @@ func TestStateStore_GatewayServices_ServiceDeletion(t *testing.T) {
 				CreateIndex: 20,
 				ModifyIndex: 20,
 			},
+			AutoHostRewrite: true,
 		},
 	}
 	assert.Equal(t, expect, out)
@@ -6916,6 +7246,7 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 		// Read everything back.
 		ws = memdb.NewWatchSet()
 		idx, out, err := s.DumpGatewayServices(ws)
+		fmt.Println(out)
 		assert.Nil(t, err)
 		assert.Equal(t, idx, uint64(21))
 		assert.Len(t, out, 2)
@@ -6933,7 +7264,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:     structs.NewServiceName("db", nil),
@@ -6943,7 +7275,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 		assert.Equal(t, expect, out)
@@ -6977,6 +7310,7 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 		assert.False(t, watchFired(ws))
 
 		idx, out, err := s.DumpGatewayServices(ws)
+		fmt.Println(out)
 		assert.Nil(t, err)
 		assert.Equal(t, idx, uint64(21))
 		assert.Len(t, out, 2)
@@ -6994,7 +7328,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:     structs.NewServiceName("db", nil),
@@ -7004,7 +7339,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 		assert.Equal(t, expect, out)
@@ -7034,7 +7370,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:     structs.NewServiceName("db", nil),
@@ -7044,7 +7381,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:      structs.NewServiceName("redis", nil),
@@ -7059,7 +7397,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 22,
 					ModifyIndex: 22,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 		assert.Equal(t, expect, out)
@@ -7089,7 +7428,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:     structs.NewServiceName("db", nil),
@@ -7099,7 +7439,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 21,
 					ModifyIndex: 21,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 		assert.Equal(t, expect, out)
@@ -7133,7 +7474,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 24,
 					ModifyIndex: 24,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 		}
 		assert.Equal(t, expect, out)
@@ -7191,7 +7533,8 @@ func TestStateStore_DumpGatewayServices(t *testing.T) {
 					CreateIndex: 24,
 					ModifyIndex: 24,
 				},
-				ServiceKind: structs.GatewayServiceKindService,
+				ServiceKind:     structs.GatewayServiceKindService,
+				AutoHostRewrite: true,
 			},
 			{
 				Service:     structs.NewServiceName("api", nil),
@@ -8209,6 +8552,85 @@ func TestCatalog_cleanupGatewayWildcards_panic(t *testing.T) {
 
 	// Now delete the node "foo", and this would panic because of the deletion within an iterator
 	require.NoError(t, s.DeleteNode(6, "foo", nil, ""))
+}
+
+func TestCatalog_cleanupGatewayWildcards_proxy(t *testing.T) {
+	s := testStateStore(t)
+
+	require.NoError(t, s.EnsureNode(0, &structs.Node{
+		ID:   "c73b8fdf-4ef8-4e43-9aa2-59e85cc6a70c",
+		Node: "foo",
+	}))
+	require.NoError(t, s.EnsureConfigEntry(1, &structs.ProxyConfigEntry{
+		Kind: structs.ProxyDefaults,
+		Name: structs.ProxyConfigGlobal,
+		Config: map[string]interface{}{
+			"protocol": "http",
+		},
+	}))
+
+	defaultMeta := structs.DefaultEnterpriseMetaInDefaultPartition()
+
+	require.NoError(t, s.EnsureConfigEntry(3, &structs.IngressGatewayConfigEntry{
+		Kind: "ingress-gateway",
+		Name: "my-gateway-2-ingress",
+		Listeners: []structs.IngressListener{
+			{
+				Port:     1111,
+				Protocol: "http",
+				Services: []structs.IngressService{
+					{
+						Name:           "*",
+						EnterpriseMeta: *defaultMeta,
+					},
+				},
+			},
+		},
+	}))
+
+	// Register two services, a regular service, and a sidecar proxy for it
+	api := structs.NodeService{
+		ID:             "api",
+		Service:        "api",
+		Address:        "127.0.0.2",
+		Port:           443,
+		EnterpriseMeta: *defaultMeta,
+	}
+	require.NoError(t, s.EnsureService(4, "foo", &api))
+	proxy := structs.NodeService{
+		Kind:    structs.ServiceKindConnectProxy,
+		ID:      "api-proxy",
+		Service: "api-proxy",
+		Address: "127.0.0.3",
+		Port:    443,
+		Proxy: structs.ConnectProxyConfig{
+			DestinationServiceName: "api",
+			DestinationServiceID:   "api",
+		},
+		EnterpriseMeta: *defaultMeta,
+	}
+	require.NoError(t, s.EnsureService(5, "foo", &proxy))
+
+	// make sure we have only one gateway service
+	_, services, err := s.GatewayServices(nil, "my-gateway-2-ingress", defaultMeta)
+	require.NoError(t, err)
+	require.Len(t, services, 1)
+
+	// now delete the target service
+	require.NoError(t, s.DeleteService(6, "foo", "api", nil, ""))
+
+	// at this point we still have the gateway services because we have a connect proxy still
+	_, services, err = s.GatewayServices(nil, "my-gateway-2-ingress", defaultMeta)
+	require.NoError(t, err)
+	require.Len(t, services, 1)
+
+	// now delete the connect proxy
+	require.NoError(t, s.DeleteService(7, "foo", "api-proxy", nil, ""))
+
+	// make sure we no longer have any services
+	_, services, err = s.GatewayServices(nil, "my-gateway-2-ingress", defaultMeta)
+	require.NoError(t, err)
+	require.Len(t, services, 0)
 }
 
 func TestCatalog_DownstreamsForService(t *testing.T) {

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package acl
 
@@ -148,6 +148,14 @@ func checkAllowSnapshot(t *testing.T, authz Authorizer, prefix string, entCtx *A
 	require.Equal(t, Allow, authz.Snapshot(entCtx))
 }
 
+func checkAllowTrafficPermissionsRead(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Allow, authz.TrafficPermissionsRead(prefix, entCtx))
+}
+
+func checkAllowTrafficPermissionsWrite(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Allow, authz.TrafficPermissionsWrite(prefix, entCtx))
+}
+
 func checkDenyACLRead(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
 	require.Equal(t, Deny, authz.ACLRead(entCtx))
 }
@@ -260,6 +268,14 @@ func checkDenyServiceReadAll(t *testing.T, authz Authorizer, _ string, entCtx *A
 	require.Equal(t, Deny, authz.ServiceReadAll(entCtx))
 }
 
+func checkAllowServiceReadPrefix(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Allow, authz.ServiceReadPrefix(prefix, entCtx))
+}
+
+func checkDenyServiceReadPrefix(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Deny, authz.ServiceReadPrefix(prefix, entCtx))
+}
+
 func checkDenyServiceWrite(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
 	require.Equal(t, Deny, authz.ServiceWrite(prefix, entCtx))
 }
@@ -278,6 +294,14 @@ func checkDenySessionWrite(t *testing.T, authz Authorizer, prefix string, entCtx
 
 func checkDenySnapshot(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
 	require.Equal(t, Deny, authz.Snapshot(entCtx))
+}
+
+func checkDenyTrafficPermissionsRead(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Deny, authz.TrafficPermissionsRead(prefix, entCtx))
+}
+
+func checkDenyTrafficPermissionsWrite(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Deny, authz.TrafficPermissionsWrite(prefix, entCtx))
 }
 
 func checkDefaultACLRead(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
@@ -392,6 +416,10 @@ func checkDefaultServiceReadAll(t *testing.T, authz Authorizer, _ string, entCtx
 	require.Equal(t, Default, authz.ServiceReadAll(entCtx))
 }
 
+func checkDefaultServiceReadPrefix(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
+	require.Equal(t, Default, authz.ServiceReadPrefix(prefix, entCtx))
+}
+
 func checkDefaultServiceWrite(t *testing.T, authz Authorizer, prefix string, entCtx *AuthorizerContext) {
 	require.Equal(t, Default, authz.ServiceWrite(prefix, entCtx))
 }
@@ -458,6 +486,7 @@ func TestACL(t *testing.T) {
 				{name: "DenyServiceRead", check: checkDenyServiceRead},
 				{name: "DenyServiceReadAll", check: checkDenyServiceReadAll},
 				{name: "DenyServiceWrite", check: checkDenyServiceWrite},
+				{name: "DenyServiceWriteAny", check: checkDenyServiceWriteAny},
 				{name: "DenySessionRead", check: checkDenySessionRead},
 				{name: "DenySessionWrite", check: checkDenySessionWrite},
 				{name: "DenySnapshot", check: checkDenySnapshot},
@@ -494,9 +523,12 @@ func TestACL(t *testing.T) {
 				{name: "AllowServiceRead", check: checkAllowServiceRead},
 				{name: "AllowServiceReadAll", check: checkAllowServiceReadAll},
 				{name: "AllowServiceWrite", check: checkAllowServiceWrite},
+				{name: "AllowServiceWriteAny", check: checkAllowServiceWriteAny},
 				{name: "AllowSessionRead", check: checkAllowSessionRead},
 				{name: "AllowSessionWrite", check: checkAllowSessionWrite},
 				{name: "DenySnapshot", check: checkDenySnapshot},
+				{name: "AllowTrafficPermissionsRead", check: checkAllowTrafficPermissionsRead},
+				{name: "AllowTrafficPermissionsWrite", check: checkAllowTrafficPermissionsWrite},
 			},
 		},
 		{
@@ -530,9 +562,12 @@ func TestACL(t *testing.T) {
 				{name: "AllowServiceRead", check: checkAllowServiceRead},
 				{name: "AllowServiceReadAll", check: checkAllowServiceReadAll},
 				{name: "AllowServiceWrite", check: checkAllowServiceWrite},
+				{name: "AllowServiceWriteAny", check: checkAllowServiceWriteAny},
 				{name: "AllowSessionRead", check: checkAllowSessionRead},
 				{name: "AllowSessionWrite", check: checkAllowSessionWrite},
 				{name: "AllowSnapshot", check: checkAllowSnapshot},
+				{name: "AllowTrafficPermissionsRead", check: checkAllowTrafficPermissionsRead},
+				{name: "AllowTrafficPermissionsWrite", check: checkAllowTrafficPermissionsWrite},
 			},
 		},
 		{

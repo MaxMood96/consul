@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package peerstream
 
@@ -747,7 +747,7 @@ func (m *subscriptionManager) NotifyStandardService(
 //
 // This name was chosen to match existing "sidecar service" generation logic
 // and similar logic in the Service Identity synthetic ACL policies.
-const syntheticProxyNameSuffix = "-sidecar-proxy"
+const syntheticProxyNameSuffix = structs.SidecarProxySuffix
 
 func generateProxyNameForDiscoveryChain(sn structs.ServiceName) structs.ServiceName {
 	return structs.NewServiceName(sn.Name+syntheticProxyNameSuffix, &sn.EnterpriseMeta)
@@ -882,6 +882,10 @@ func (m *subscriptionManager) subscribeServerAddrs(
 	idx uint64,
 	updateCh chan<- cache.UpdateEvent,
 ) (uint64, error) {
+	// TODO(inproc-grpc) - Look into using the insecure in-process gRPC Channel
+	// to get notified for server address updates instead of hooking into the
+	// subscription service.
+
 	// following code adapted from serverdiscovery/watch_servers.go
 	sub, err := m.backend.Subscribe(&stream.SubscribeRequest{
 		Topic:   autopilotevents.EventTopicReadyServers,

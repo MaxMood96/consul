@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,6 +90,7 @@ const (
 	PeeringSecretsWriteType                     = 40
 	RaftLogVerifierCheckpoint                   = 41 // Only used for log verifier, no-op on FSM.
 	ResourceOperationType                       = 42
+	UpdateVirtualIPRequestType                  = 43
 )
 
 const (
@@ -156,6 +159,7 @@ var requestTypeStrings = map[MessageType]string{
 	PeeringSecretsWriteType:         "PeeringSecret",
 	RaftLogVerifierCheckpoint:       "RaftLogVerifierCheckpoint",
 	ResourceOperationType:           "Resource",
+	UpdateVirtualIPRequestType:      "UpdateManualVirtualIPRequestType",
 }
 
 const (
@@ -218,9 +222,15 @@ const (
 	// WildcardSpecifier is the string which should be used for specifying a wildcard
 	// The exact semantics of the wildcard is left up to the code where its used.
 	WildcardSpecifier = "*"
+
+	// MetaConsulVersion is the node metadata key used to store the node's consul version
+	MetaConsulVersion = "consul-version"
 )
 
 var allowedConsulMetaKeysForMeshGateway = map[string]struct{}{MetaWANFederationKey: {}}
+
+// CEDowngrade indicates if we are in downgrading from ent to ce
+var CEDowngrade = os.Getenv("CONSUL_ENTERPRISE_DOWNGRADE_TO_CE") == "true"
 
 var (
 	NodeMaintCheckID = NewCheckID(NodeMaint, nil)
@@ -418,6 +428,17 @@ func (q QueryBackend) String() string {
 	}
 }
 
+func QueryBackendFromString(s string) QueryBackend {
+	switch s {
+	case "blocking-query":
+		return QueryBackendBlocking
+	case "streaming":
+		return QueryBackendStreaming
+	default:
+		return QueryBackendBlocking
+	}
+}
+
 // QueryMeta allows a query response to include potentially
 // useful metadata about a query
 type QueryMeta struct {
@@ -562,7 +583,11 @@ type QuerySource struct {
 	Segment       string
 	Node          string
 	NodePartition string `json:",omitempty"`
-	Ip            string
+	// DisableNode indicates that the Node and NodePartition fields should not be used
+	// for determining the flow of the RPC. This is needed for agentless + wanfed to
+	// utilize streaming RPCs.
+	DisableNode bool `json:",omitempty"`
+	Ip          string
 }
 
 func (s QuerySource) NodeEnterpriseMeta() *acl.EnterpriseMeta {
@@ -646,6 +671,7 @@ type ServiceDumpRequest struct {
 	Datacenter         string
 	ServiceKind        ServiceKind
 	UseServiceKind     bool
+	NodesOnly          bool
 	Source             QuerySource
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	PeerName           string
@@ -678,6 +704,7 @@ func (r *ServiceDumpRequest) CacheInfo() cache.RequestInfo {
 	v, err := hashstructure.Hash([]interface{}{
 		keyKind,
 		r.UseServiceKind,
+		r.NodesOnly,
 		r.Filter,
 		r.EnterpriseMeta,
 	}, nil)
@@ -726,16 +753,20 @@ type ServiceSpecificRequest struct {
 	// The name of the peer that the requested service was imported from.
 	PeerName string
 
+	// The name of the sameness group that should be the target of the query.
+	SamenessGroup string
+
 	NodeMetaFilters map[string]string
 	ServiceName     string
 	ServiceKind     ServiceKind
 	// DEPRECATED (singular-service-tag) - remove this when backwards RPC compat
 	// with 1.2.x is not required.
-	ServiceTag     string
-	ServiceTags    []string
-	ServiceAddress string
-	TagFilter      bool // Controls tag filtering
-	Source         QuerySource
+	ServiceTag       string
+	ServiceTags      []string
+	ServiceAddress   string
+	TagFilter        bool // Controls tag filtering
+	HealthFilterType HealthFilterType
+	Source           QuerySource
 
 	// Connect if true will only search for Connect-compatible services.
 	Connect bool
@@ -793,9 +824,11 @@ func (r *ServiceSpecificRequest) CacheInfo() cache.RequestInfo {
 		r.Filter,
 		r.EnterpriseMeta,
 		r.PeerName,
+		r.SamenessGroup,
 		r.Ingress,
 		r.ServiceKind,
 		r.MergeCentralConfig,
+		r.HealthFilterType,
 	}, nil)
 	if err == nil {
 		// If there is an error, we don't set the key. A blank key forces
@@ -1268,6 +1301,8 @@ func (a ServiceAddress) ToAPIServiceAddress() api.ServiceAddress {
 	return api.ServiceAddress{Address: a.Address, Port: a.Port}
 }
 
+const SidecarProxySuffix = "-sidecar-proxy"
+
 // NodeService is a service provided by a node
 type NodeService struct {
 	// Kind is the kind of service this is. Different kinds of services may
@@ -1465,6 +1500,10 @@ func (s *NodeService) IsGateway() bool {
 func (s *NodeService) Validate() error {
 	var result error
 
+	if err := s.Locality.Validate(); err != nil {
+		result = multierror.Append(result, err)
+	}
+
 	if s.Kind == ServiceKindConnectProxy {
 		if s.Port == 0 && s.SocketPath == "" {
 			result = multierror.Append(result, fmt.Errorf("Port or SocketPath must be set for a %s", s.Kind))
@@ -1504,6 +1543,10 @@ func (s *NodeService) ValidateForAgent() error {
 		if s.Connect.Native {
 			result = multierror.Append(result, fmt.Errorf(
 				"A Proxy cannot also be Connect Native, only typical services"))
+		}
+
+		if err := validateOpaqueProxyConfig(s.Proxy.Config); err != nil {
+			result = multierror.Append(result, fmt.Errorf("Proxy.Config: %w", err))
 		}
 
 		// ensure we don't have multiple upstreams for the same service
@@ -1853,6 +1896,7 @@ type HealthCheckDefinition struct {
 	Body                           string              `json:",omitempty"`
 	DisableRedirects               bool                `json:",omitempty"`
 	TCP                            string              `json:",omitempty"`
+	TCPUseTLS                      bool                `json:",omitempty"`
 	UDP                            string              `json:",omitempty"`
 	H2PING                         string              `json:",omitempty"`
 	OSService                      string              `json:",omitempty"`
@@ -2005,6 +2049,7 @@ func (c *HealthCheck) CheckType() *CheckType {
 		Body:                           c.Definition.Body,
 		DisableRedirects:               c.Definition.DisableRedirects,
 		TCP:                            c.Definition.TCP,
+		TCPUseTLS:                      c.Definition.TCPUseTLS,
 		UDP:                            c.Definition.UDP,
 		H2PING:                         c.Definition.H2PING,
 		OSService:                      c.Definition.OSService,
@@ -2072,6 +2117,31 @@ func (csn *CheckServiceNode) CanRead(authz acl.Authorizer) acl.EnforcementDecisi
 	return acl.Allow
 }
 
+func (csn *CheckServiceNode) Locality() *Locality {
+	if csn.Service != nil && csn.Service.Locality != nil {
+		return csn.Service.Locality
+	}
+
+	if csn.Node != nil && csn.Node.Locality != nil {
+		return csn.Node.Locality
+	}
+
+	return nil
+}
+
+func (csn *CheckServiceNode) ExcludeBasedOnChecks(opts CheckServiceNodeFilterOptions) bool {
+	for _, check := range csn.Checks {
+		if slices.Contains(opts.IgnoreCheckIDs, check.CheckID) {
+			// Skip this _check_ but keep looking at other checks for this node.
+			continue
+		}
+		if opts.FilterType.ExcludeBasedOnStatus(check.Status) {
+			return true
+		}
+	}
+	return false
+}
+
 type CheckServiceNodes []CheckServiceNode
 
 func (csns CheckServiceNodes) DeepCopy() CheckServiceNodes {
@@ -2111,39 +2181,42 @@ func (nodes CheckServiceNodes) ShallowClone() CheckServiceNodes {
 	return dup
 }
 
+// HealthFilterType is used to filter nodes based on their health status.
+type HealthFilterType int32
+
+func (h HealthFilterType) ExcludeBasedOnStatus(status string) bool {
+	switch {
+	case h == HealthFilterExcludeCritical && status == api.HealthCritical:
+		return true
+	case h == HealthFilterIncludeOnlyPassing && status != api.HealthPassing:
+		return true
+	}
+	return false
+}
+
+// These are listed from most to least inclusive.
+const (
+	HealthFilterIncludeAll         HealthFilterType = 0
+	HealthFilterExcludeCritical    HealthFilterType = 1
+	HealthFilterIncludeOnlyPassing HealthFilterType = 2
+)
+
+type CheckServiceNodeFilterOptions struct {
+	FilterType                  HealthFilterType
+	IgnoreCheckIDs              []types.CheckID
+	disableReceiverModification bool
+}
+
 // Filter removes nodes that are failing health checks (and any non-passing
 // check if that option is selected). Note that this returns the filtered
 // results AND modifies the receiver for performance.
-func (nodes CheckServiceNodes) Filter(onlyPassing bool) CheckServiceNodes {
-	return nodes.FilterIgnore(onlyPassing, nil)
-}
-
-// FilterIgnore removes nodes that are failing health checks just like Filter.
-// It also ignores the status of any check with an ID present in ignoreCheckIDs
-// as if that check didn't exist. Note that this returns the filtered results
-// AND modifies the receiver for performance.
-func (nodes CheckServiceNodes) FilterIgnore(onlyPassing bool,
-	ignoreCheckIDs []types.CheckID) CheckServiceNodes {
+func (nodes CheckServiceNodes) Filter(opts CheckServiceNodeFilterOptions) CheckServiceNodes {
 	n := len(nodes)
-OUTER:
 	for i := 0; i < n; i++ {
-		node := nodes[i]
-	INNER:
-		for _, check := range node.Checks {
-			for _, ignore := range ignoreCheckIDs {
-				if check.CheckID == ignore {
-					// Skip this _check_ but keep looking at other checks for this node.
-					continue INNER
-				}
-			}
-			if check.Status == api.HealthCritical ||
-				(onlyPassing && check.Status != api.HealthPassing) {
-				nodes[i], nodes[n-1] = nodes[n-1], CheckServiceNode{}
-				n--
-				i--
-				// Skip this _node_ now we've swapped it off the end of the list.
-				continue OUTER
-			}
+		if nodes[i].ExcludeBasedOnChecks(opts) {
+			nodes[i], nodes[n-1] = nodes[n-1], CheckServiceNode{}
+			n--
+			i--
 		}
 	}
 	return nodes[:n]
@@ -2289,6 +2362,7 @@ type ServiceUsage struct {
 	ServiceInstances         int
 	ConnectServiceInstances  map[string]int
 	BillableServiceInstances int
+	Nodes                    int
 	EnterpriseServiceUsage
 }
 
@@ -2300,6 +2374,11 @@ type PeeredServiceName struct {
 
 func (psn PeeredServiceName) String() string {
 	return fmt.Sprintf("%v:%v", psn.ServiceName.String(), psn.Peer)
+}
+
+type ServiceNameWithSamenessGroup struct {
+	SamenessGroup string
+	ServiceName
 }
 
 type ServiceName struct {
@@ -3025,6 +3104,26 @@ func DurationFromProto(d *durationpb.Duration) time.Duration {
 }
 
 // This should only be used for conversions generated by MOG
+func DurationPointerToProto(d *time.Duration) *durationpb.Duration {
+	if d == nil {
+		return nil
+	}
+	return durationpb.New(*d)
+}
+
+// This should only be used for conversions generated by MOG
+func DurationPointerFromProto(d *durationpb.Duration) *time.Duration {
+	if d == nil {
+		return nil
+	}
+	return DurationPointer(d.AsDuration())
+}
+
+func DurationPointer(d time.Duration) *time.Duration {
+	return &d
+}
+
+// This should only be used for conversions generated by MOG
 func TimeFromProto(s *timestamppb.Timestamp) time.Time {
 	return s.AsTime()
 }
@@ -3066,4 +3165,16 @@ func (l *Locality) GetRegion() string {
 		return ""
 	}
 	return l.Region
+}
+
+func (l *Locality) Validate() error {
+	if l == nil {
+		return nil
+	}
+
+	if l.Region == "" && l.Zone != "" {
+		return fmt.Errorf("zone cannot be set without region")
+	}
+
+	return nil
 }

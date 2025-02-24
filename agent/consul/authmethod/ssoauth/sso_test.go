@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package ssoauth
 
@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/square/go-jose.v2/jwt"
 
 	"github.com/hashicorp/consul/agent/consul/authmethod"
 	"github.com/hashicorp/consul/agent/structs"

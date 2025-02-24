@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BUSL-1.1
 
 
 readonly PACKAGE_DIR="$(dirname "${BASH_SOURCE[0]}")"
@@ -24,6 +24,7 @@ deep-copy \
   -type DiscoverySplit \
   -type ExposeConfig \
   -type ExportedServicesConfigEntry \
+  -type FileSystemCertificateConfigEntry \
   -type GatewayService \
   -type GatewayServiceTLSConfig \
   -type HTTPHeaderModifiers \
@@ -51,6 +52,7 @@ deep-copy \
   -type ServiceRoute \
   -type ServiceRouteDestination \
   -type ServiceRouteMatch \
+  -type ServiceSpecificRequest \
   -type TCPRouteConfigEntry \
   -type Upstream \
   -type UpstreamConfiguration \
