@@ -1,9 +1,11 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package local
 
 import (
+	"context"
+
 	"github.com/hashicorp/consul/agent/grpc-external/limiter"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	structs "github.com/hashicorp/consul/agent/structs"
@@ -20,7 +22,13 @@ func NewConfigSource(cfgMgr ConfigManager) *ConfigSource {
 	return &ConfigSource{cfgMgr}
 }
 
-func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, _ string) (<-chan *proxycfg.ConfigSnapshot, limiter.SessionTerminatedChan, proxycfg.CancelFunc, error) {
+func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, _ string) (
+	<-chan *proxycfg.ConfigSnapshot,
+	limiter.SessionTerminatedChan,
+	proxycfg.SrcTerminatedChan,
+	context.CancelFunc,
+	error,
+) {
 	watchCh, cancelWatch := m.manager.Watch(proxycfg.ProxyID{
 		ServiceID: serviceID,
 		NodeName:  nodeName,
@@ -31,5 +39,5 @@ func (m *ConfigSource) Watch(serviceID structs.ServiceID, nodeName string, _ str
 		// is checked before the watch is created).
 		Token: "",
 	})
-	return watchCh, nil, cancelWatch, nil
+	return watchCh, nil, nil, cancelWatch, nil
 }

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package dataplane
 
@@ -7,12 +7,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/acl/resolver"
@@ -20,10 +21,10 @@ import (
 	"github.com/hashicorp/consul/agent/grpc-external/testutils"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/proto-public/pbdataplane"
-	"github.com/hashicorp/consul/types"
 )
 
 const (
+	testIdentity     = "test-identity"
 	testToken        = "acl-token-get-envoy-bootstrap-params"
 	testServiceName  = "web"
 	proxyServiceID   = "web-proxy"
@@ -41,13 +42,15 @@ const (
 	proxyDefaultsRequestTimeout   = 1111
 	serviceDefaultsProtocol       = "tcp"
 	serviceDefaultsConnectTimeout = 4444
+
+	testAccessLogs = "{\"name\":\"Consul Listener Filter Log\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog\",\"logFormat\":{\"jsonFormat\":{\"custom_field\":\"%START_TIME%\"}}}}"
 )
 
 func testRegisterRequestProxy(t *testing.T) *structs.RegisterRequest {
 	return &structs.RegisterRequest{
 		Datacenter: serverDC,
 		Node:       nodeName,
-		ID:         types.NodeID(nodeID),
+		ID:         nodeID,
 		Address:    "127.0.0.1",
 		Service: &structs.NodeService{
 			Kind:    structs.ServiceKindConnectProxy,
@@ -68,7 +71,7 @@ func testRegisterRequestProxy(t *testing.T) *structs.RegisterRequest {
 
 func testRegisterIngressGateway(t *testing.T) *structs.RegisterRequest {
 	registerReq := structs.TestRegisterIngressGateway(t)
-	registerReq.ID = types.NodeID("2980b72b-bd9d-9d7b-d4f9-951bf7508d95")
+	registerReq.ID = "2980b72b-bd9d-9d7b-d4f9-951bf7508d95"
 	registerReq.Service.ID = registerReq.Service.Service
 	registerReq.Service.Proxy.Config = map[string]interface{}{
 		proxyConfigKey: proxyConfigValue,
@@ -167,9 +170,7 @@ func TestGetEnvoyBootstrapParams_Success(t *testing.T) {
 		require.Equal(t, tc.registerReq.EnterpriseMeta.PartitionOrDefault(), resp.Partition)
 		require.Equal(t, tc.registerReq.EnterpriseMeta.NamespaceOrDefault(), resp.Namespace)
 		requireConfigField(t, resp, proxyConfigKey, structpb.NewStringValue(proxyConfigValue))
-		require.Equal(t, convertToResponseServiceKind(tc.registerReq.Service.Kind), resp.ServiceKind)
 		require.Equal(t, tc.registerReq.Node, resp.NodeName)
-		require.Equal(t, string(tc.registerReq.ID), resp.NodeId)
 
 		if tc.serviceDefaults != nil && tc.proxyDefaults != nil {
 			// service-defaults take precedence over proxy-defaults

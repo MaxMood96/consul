@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfg
 
@@ -256,6 +256,9 @@ func setupTestVariationConfigEntriesAndSnapshot(
 	case "chain-and-router":
 	case "lb-resolver":
 	case "register-to-terminating-gateway":
+	case "redirect-to-lb-node":
+	case "resolver-with-lb":
+	case "splitter-overweight":
 	default:
 		extraEvents := extraUpdateEvents(t, variation, dbUID)
 		events = append(events, extraEvents...)
@@ -478,6 +481,7 @@ func setupTestVariationDiscoveryChain(
 				Kind:           structs.ProxyDefaults,
 				Name:           structs.ProxyConfigGlobal,
 				EnterpriseMeta: em,
+				Protocol:       "http",
 				Config: map[string]interface{}{
 					"protocol": "http",
 				},
@@ -531,15 +535,50 @@ func setupTestVariationDiscoveryChain(
 				Kind:           structs.ServiceResolver,
 				Name:           "db",
 				EnterpriseMeta: entMeta,
-				ConnectTimeout: 33 * time.Second,
-				RequestTimeout: 33 * time.Second,
+				ConnectTimeout: 25 * time.Second,
 			},
 			&structs.ProxyConfigEntry{
 				Kind:           structs.ProxyDefaults,
 				Name:           structs.ProxyConfigGlobal,
 				EnterpriseMeta: entMeta,
+				Protocol:       "http",
 				Config: map[string]interface{}{
 					"protocol": "http",
+				},
+			},
+			// Adding a ServiceRouter in this case allows testing ServiceRoute.Destination timeouts.
+			&structs.ServiceRouterConfigEntry{
+				Kind:           structs.ServiceRouter,
+				Name:           "db",
+				EnterpriseMeta: entMeta,
+				Routes: []structs.ServiceRoute{
+					{
+						Match: &structs.ServiceRouteMatch{
+							HTTP: &structs.ServiceRouteHTTPMatch{
+								PathPrefix: "/big-side",
+							},
+						},
+						Destination: &structs.ServiceRouteDestination{
+							Service: "big-side",
+							// Test disabling idle timeout.
+							IdleTimeout: -1 * time.Second,
+							// Test a positive value for request timeout.
+							RequestTimeout: 10 * time.Second,
+						},
+					},
+					{
+						Match: &structs.ServiceRouteMatch{
+							HTTP: &structs.ServiceRouteHTTPMatch{
+								PathPrefix: "/lil-bit-side",
+							},
+						},
+						Destination: &structs.ServiceRouteDestination{
+							Service: "lil-bit-side",
+							// Test zero values for these timeouts.
+							IdleTimeout:    0 * time.Second,
+							RequestTimeout: 0 * time.Second,
+						},
+					},
 				},
 			},
 			&structs.ServiceSplitterConfigEntry{
@@ -547,6 +586,16 @@ func setupTestVariationDiscoveryChain(
 				Name:           "db",
 				EnterpriseMeta: entMeta,
 				Splits: []structs.ServiceSplit{
+					{
+						Weight:  1,
+						Service: "db",
+						RequestHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "db"},
+						},
+						ResponseHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "db"},
+						},
+					},
 					{
 						Weight:  95.5,
 						Service: "big-side",
@@ -558,7 +607,7 @@ func setupTestVariationDiscoveryChain(
 						},
 					},
 					{
-						Weight:  4,
+						Weight:  3,
 						Service: "goldilocks-side",
 						RequestHeaders: &structs.HTTPHeaderModifiers{
 							Set: map[string]string{"x-split-leg": "goldilocks"},
@@ -569,6 +618,62 @@ func setupTestVariationDiscoveryChain(
 					},
 					{
 						Weight:  0.5,
+						Service: "lil-bit-side",
+						RequestHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "small"},
+						},
+						ResponseHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "small"},
+						},
+					},
+				},
+			},
+		)
+	case "splitter-overweight":
+		entries = append(entries,
+			&structs.ServiceResolverConfigEntry{
+				Kind:           structs.ServiceResolver,
+				Name:           "db",
+				EnterpriseMeta: entMeta,
+				ConnectTimeout: 33 * time.Second,
+				RequestTimeout: 33 * time.Second,
+			},
+			&structs.ProxyConfigEntry{
+				Kind:           structs.ProxyDefaults,
+				Name:           structs.ProxyConfigGlobal,
+				EnterpriseMeta: entMeta,
+				Protocol:       "http",
+				Config: map[string]interface{}{
+					"protocol": "http",
+				},
+			},
+			&structs.ServiceSplitterConfigEntry{
+				Kind:           structs.ServiceSplitter,
+				Name:           "db",
+				EnterpriseMeta: entMeta,
+				Splits: []structs.ServiceSplit{
+					{
+						Weight:  100.0,
+						Service: "big-side",
+						RequestHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "big"},
+						},
+						ResponseHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "big"},
+						},
+					},
+					{
+						Weight:  100.0,
+						Service: "goldilocks-side",
+						RequestHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "goldilocks"},
+						},
+						ResponseHeaders: &structs.HTTPHeaderModifiers{
+							Set: map[string]string{"x-split-leg": "goldilocks"},
+						},
+					},
+					{
+						Weight:  100.0,
 						Service: "lil-bit-side",
 						RequestHeaders: &structs.HTTPHeaderModifiers{
 							Set: map[string]string{"x-split-leg": "small"},
@@ -593,6 +698,7 @@ func setupTestVariationDiscoveryChain(
 				Kind:           structs.ProxyDefaults,
 				Name:           structs.ProxyConfigGlobal,
 				EnterpriseMeta: entMeta,
+				Protocol:       "grpc",
 				Config: map[string]interface{}{
 					"protocol": "grpc",
 				},
@@ -628,6 +734,7 @@ func setupTestVariationDiscoveryChain(
 				Kind:           structs.ProxyDefaults,
 				Name:           structs.ProxyConfigGlobal,
 				EnterpriseMeta: entMeta,
+				Protocol:       "http",
 				Config: map[string]interface{}{
 					"protocol": "http",
 				},
@@ -879,6 +986,7 @@ func setupTestVariationDiscoveryChain(
 				Kind:           structs.ProxyDefaults,
 				Name:           structs.ProxyConfigGlobal,
 				EnterpriseMeta: entMeta,
+				Protocol:       "http",
 				Config: map[string]interface{}{
 					"protocol": "http",
 				},
@@ -918,9 +1026,73 @@ func setupTestVariationDiscoveryChain(
 							FieldValue: "x-user-id",
 						},
 						{
+							Field:      "query_parameter",
+							FieldValue: "my-pretty-param",
+						},
+						{
 							SourceIP: true,
 							Terminal: true,
 						},
+					},
+				},
+			})
+	case "redirect-to-lb-node":
+		entries = append(entries,
+			&structs.ProxyConfigEntry{
+				Kind:           structs.ProxyDefaults,
+				Name:           structs.ProxyConfigGlobal,
+				EnterpriseMeta: entMeta,
+				Protocol:       "http",
+				Config: map[string]interface{}{
+					"protocol": "http",
+				},
+			},
+			&structs.ServiceRouterConfigEntry{
+				Kind:           structs.ServiceRouter,
+				Name:           "db",
+				EnterpriseMeta: entMeta,
+				Routes: []structs.ServiceRoute{
+					{
+						Match: httpMatch(&structs.ServiceRouteHTTPMatch{
+							PathPrefix: "/web",
+						}),
+						Destination: toService("web"),
+					},
+				},
+			},
+			&structs.ServiceResolverConfigEntry{
+				Kind:           structs.ServiceResolver,
+				Name:           "web",
+				EnterpriseMeta: entMeta,
+				LoadBalancer: &structs.LoadBalancer{
+					Policy: "ring_hash",
+					RingHashConfig: &structs.RingHashConfig{
+						MinimumRingSize: 20,
+						MaximumRingSize: 30,
+					},
+				},
+			},
+		)
+	case "resolver-with-lb":
+		entries = append(entries,
+			&structs.ProxyConfigEntry{
+				Kind:           structs.ProxyDefaults,
+				Name:           structs.ProxyConfigGlobal,
+				EnterpriseMeta: entMeta,
+				Protocol:       "http",
+				Config: map[string]interface{}{
+					"protocol": "http",
+				},
+			},
+			&structs.ServiceResolverConfigEntry{
+				Kind:           structs.ServiceResolver,
+				Name:           "db",
+				EnterpriseMeta: entMeta,
+				LoadBalancer: &structs.LoadBalancer{
+					Policy: "ring_hash",
+					RingHashConfig: &structs.RingHashConfig{
+						MinimumRingSize: 20,
+						MaximumRingSize: 30,
 					},
 				},
 			},

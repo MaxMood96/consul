@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package lib
 
@@ -146,8 +146,13 @@ type TelemetryConfig struct {
 
 	// DisableHostname will disable hostname prefixing for all metrics.
 	//
-	// hcl: telemetry { disable_hostname = (true|false)
+	// hcl: telemetry { disable_hostname = (true|false) }
 	DisableHostname bool `json:"disable_hostname,omitempty" mapstructure:"disable_hostname"`
+
+	// DisablePerTenancyUsageMetrics will disable setting tenancy labels on usage metrics.
+	//
+	// hcl: telemetry { disable_per_tenancy_usage_metrics = (true|false) }
+	DisablePerTenancyUsageMetrics bool `json:"disable_per_tenancy_usage_metrics,omitempty" mapstructure:"disable_per_tenancy_usage_metrics"`
 
 	// DogStatsdAddr is the address of a dogstatsd instance. If provided,
 	// metrics will be sent to that instance
@@ -203,6 +208,11 @@ type TelemetryConfig struct {
 	//
 	// hcl: telemetry { statsite_address = string }
 	StatsiteAddr string `json:"statsite_address,omitempty" mapstructure:"statsite_address"`
+
+	// EnableHostMetrics will enable metrics collected about the host system such as cpu memory and disk usage.
+	//
+	// hcl: telemetry { enable_host_metrics = (true|false) }
+	EnableHostMetrics bool `json:"enable_host_metrics,omitempty" mapstructure:"enable_host_metrics"`
 
 	// PrometheusOpts provides configuration for the PrometheusSink. Currently the only configuration
 	// we acquire from hcl is the retention time. We also use definition slices that are set in agent setup
@@ -324,7 +334,7 @@ func circonusSink(cfg TelemetryConfig, _ string) (metrics.MetricSink, error) {
 	return sink, nil
 }
 
-func configureSinks(cfg TelemetryConfig, memSink metrics.MetricSink) (metrics.FanoutSink, error) {
+func configureSinks(cfg TelemetryConfig, memSink metrics.MetricSink, extraSinks []metrics.MetricSink) (metrics.FanoutSink, error) {
 	metricsConf := metrics.DefaultConfig(cfg.MetricsPrefix)
 	metricsConf.EnableHostname = !cfg.DisableHostname
 	metricsConf.FilterDefault = cfg.FilterDefault
@@ -349,14 +359,15 @@ func configureSinks(cfg TelemetryConfig, memSink metrics.MetricSink) (metrics.Fa
 	addSink(dogstatdSink)
 	addSink(circonusSink)
 	addSink(prometheusSink)
-
-	if len(sinks) > 0 {
-		sinks = append(sinks, memSink)
-		metrics.NewGlobal(metricsConf, sinks)
-	} else {
-		metricsConf.EnableHostname = false
-		metrics.NewGlobal(metricsConf, memSink)
+	for _, sink := range extraSinks {
+		if sink != nil {
+			sinks = append(sinks, sink)
+		}
 	}
+
+	sinks = append(sinks, memSink)
+	metrics.NewGlobal(metricsConf, sinks)
+
 	return sinks, errors
 }
 
@@ -364,7 +375,7 @@ func configureSinks(cfg TelemetryConfig, memSink metrics.MetricSink) (metrics.Fa
 // values as returned by Runtimecfg.Config().
 // InitTelemetry retries configurating the sinks in case error is retriable
 // and retry_failed_connection is set to true.
-func InitTelemetry(cfg TelemetryConfig, logger hclog.Logger) (*MetricsConfig, error) {
+func InitTelemetry(cfg TelemetryConfig, logger hclog.Logger, extraSinks ...metrics.MetricSink) (*MetricsConfig, error) {
 	if cfg.Disable {
 		return nil, nil
 	}
@@ -384,7 +395,7 @@ func InitTelemetry(cfg TelemetryConfig, logger hclog.Logger) (*MetricsConfig, er
 		}
 		for {
 			logger.Warn("retrying configure metric sinks", "retries", waiter.Failures())
-			_, err := configureSinks(cfg, memSink)
+			_, err := configureSinks(cfg, memSink, extraSinks)
 			if err == nil {
 				logger.Info("successfully configured metrics sinks")
 				return
@@ -397,7 +408,7 @@ func InitTelemetry(cfg TelemetryConfig, logger hclog.Logger) (*MetricsConfig, er
 		}
 	}
 
-	if _, errs := configureSinks(cfg, memSink); errs != nil {
+	if _, errs := configureSinks(cfg, memSink, extraSinks); errs != nil {
 		if isRetriableError(errs) && cfg.RetryFailedConfiguration {
 			logger.Warn("failed configure sinks", "error", multierror.Flatten(errs))
 			ctx, cancel = context.WithCancel(context.Background())

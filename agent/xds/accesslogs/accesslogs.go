@@ -1,5 +1,5 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// Copyrigh (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
 
 package accesslogs
 
@@ -106,7 +106,6 @@ func getLogger(logs *structs.AccessLogsConfig) (*anypb.Any, error) {
 // getLogFormat returns an Envoy log format object that is compatible with all log sinks.
 // If a format is not provided in the proxy-defaults, the default JSON format is used.
 func getLogFormat(logs *structs.AccessLogsConfig) (*envoy_core_v3.SubstitutionFormatString, error) {
-
 	var format, formatType string
 	if logs.TextFormat == "" && logs.JSONFormat == "" {
 		format = defaultJSONFormat

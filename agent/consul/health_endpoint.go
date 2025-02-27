@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -8,15 +8,15 @@ import (
 	"sort"
 
 	"github.com/armon/go-metrics"
-	bexpr "github.com/hashicorp/go-bexpr"
-	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-memdb"
 	hashstructure_v2 "github.com/mitchellh/hashstructure/v2"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/go-bexpr"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-memdb"
 )
 
 // Health endpoint is used to query the health information
@@ -63,18 +63,23 @@ func (h *Health) ChecksInState(args *structs.ChecksInStateRequest,
 			}
 			reply.Index, reply.HealthChecks = index, checks
 
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := h.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			raw, err := filter.Execute(reply.HealthChecks)
 			if err != nil {
 				return err
 			}
 			reply.HealthChecks = raw.(structs.HealthChecks)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := h.srv.filterACL(args.Token, reply); err != nil {
-				return err
-			}
 
 			return h.srv.sortNodesByDistanceFrom(args.Source, reply.HealthChecks)
 		})
@@ -111,18 +116,23 @@ func (h *Health) NodeChecks(args *structs.NodeSpecificRequest,
 			}
 			reply.Index, reply.HealthChecks = index, checks
 
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := h.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			raw, err := filter.Execute(reply.HealthChecks)
 			if err != nil {
 				return err
 			}
 			reply.HealthChecks = raw.(structs.HealthChecks)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := h.srv.filterACL(args.Token, reply); err != nil {
-				return err
-			}
 
 			return nil
 		})
@@ -229,10 +239,8 @@ func (h *Health) ServiceNodes(args *structs.ServiceSpecificRequest, reply *struc
 	// If we're doing a connect or ingress query, we need read access to the service
 	// we're trying to find proxies for, so check that.
 	if args.Connect || args.Ingress {
-		// TODO(acl-error-enhancements) Look for ways to percolate this information up to give any feedback to the user.
 		if authz.ServiceRead(args.ServiceName, &authzContext) != acl.Allow {
-			// Just return nil, which will return an empty response (tested)
-			return nil
+			return acl.ErrPermissionDenied
 		}
 	}
 
@@ -252,68 +260,91 @@ func (h *Health) ServiceNodes(args *structs.ServiceSpecificRequest, reply *struc
 		func(ws memdb.WatchSet, state *state.Store) error {
 			var thisReply structs.IndexedCheckServiceNodes
 
-			index, nodes, err := f(ws, state, args)
+			sgIdx, sgArgs, err := h.getArgsForSamenessGroupMembers(args, ws, state)
 			if err != nil {
 				return err
 			}
 
-			resolvedNodes := nodes
-			if args.MergeCentralConfig {
-				for _, node := range resolvedNodes {
-					ns := node.Service
-					if ns.IsSidecarProxy() || ns.IsGateway() {
-						cfgIndex, mergedns, err := configentry.MergeNodeServiceWithCentralConfig(ws, state, ns, h.logger)
-						if err != nil {
-							return err
-						}
-						if cfgIndex > index {
-							index = cfgIndex
-						}
-						*node.Service = *mergedns
-					}
-				}
-
-				// Generate a hash of the resolvedNodes driving this response.
-				// Use it to determine if the response is identical to a prior wakeup.
-				newMergeHash, err := hashstructure_v2.Hash(resolvedNodes, hashstructure_v2.FormatV2, nil)
+			for _, arg := range sgArgs {
+				index, nodes, err := f(ws, state, arg)
 				if err != nil {
-					return fmt.Errorf("error hashing reply for spurious wakeup suppression: %w", err)
-				}
-				if ranMergeOnce && priorMergeHash == newMergeHash {
-					// the below assignment is not required as the if condition already validates equality,
-					// but makes it more clear that prior value is being reset to the new hash on each run.
-					priorMergeHash = newMergeHash
-					reply.Index = index
-					// NOTE: the prior response is still alive inside of *reply, which is desirable
-					return errNotChanged
-				} else {
-					priorMergeHash = newMergeHash
-					ranMergeOnce = true
+					return err
 				}
 
+				resolvedNodes := nodes
+				if arg.MergeCentralConfig {
+					for _, node := range resolvedNodes {
+						ns := node.Service
+						if ns.IsSidecarProxy() || ns.IsGateway() {
+							cfgIndex, mergedns, err := configentry.MergeNodeServiceWithCentralConfig(ws, state, ns, h.logger)
+							if err != nil {
+								return err
+							}
+							if cfgIndex > index {
+								index = cfgIndex
+							}
+							*node.Service = *mergedns
+						}
+					}
+
+					// Generate a hash of the resolvedNodes driving this response.
+					// Use it to determine if the response is identical to a prior wakeup.
+					newMergeHash, err := hashstructure_v2.Hash(resolvedNodes, hashstructure_v2.FormatV2, nil)
+					if err != nil {
+						return fmt.Errorf("error hashing reply for spurious wakeup suppression: %w", err)
+					}
+					if ranMergeOnce && priorMergeHash == newMergeHash {
+						// the below assignment is not required as the if condition already validates equality,
+						// but makes it more clear that prior value is being reset to the new hash on each run.
+						priorMergeHash = newMergeHash
+						reply.Index = index
+						// NOTE: the prior response is still alive inside of *reply, which is desirable
+						return errNotChanged
+					} else {
+						priorMergeHash = newMergeHash
+						ranMergeOnce = true
+					}
+
+				}
+
+				thisReply.Index, thisReply.Nodes = index, resolvedNodes
+
+				if len(arg.NodeMetaFilters) > 0 {
+					thisReply.Nodes = nodeMetaFilter(arg.NodeMetaFilters, thisReply.Nodes)
+				}
+
+				// Note: we filter the results with ACLs *before* applying the user-supplied
+				// bexpr filter to ensure that the user can only run expressions on data that
+				// they have access to.  This is a security measure to prevent users from
+				// running arbitrary expressions on data they don't have access to.
+				// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+				// that results they don't have access to have been removed.  If they were
+				// also allowed to run the bexpr filter on the data, they could potentially
+				// infer the specific attributes of data they don't have access to.
+				if err := h.srv.filterACL(arg.Token, &thisReply); err != nil {
+					return err
+				}
+
+				raw, err := filter.Execute(thisReply.Nodes)
+				if err != nil {
+					return err
+				}
+				filteredNodes := raw.(structs.CheckServiceNodes)
+				thisReply.Nodes = filteredNodes.Filter(structs.CheckServiceNodeFilterOptions{FilterType: arg.HealthFilterType})
+
+				if err := h.srv.sortNodesByDistanceFrom(arg.Source, thisReply.Nodes); err != nil {
+					return err
+				}
+				if len(thisReply.Nodes) > 0 {
+					break
+				}
 			}
 
-			thisReply.Index, thisReply.Nodes = index, resolvedNodes
-
-			if len(args.NodeMetaFilters) > 0 {
-				thisReply.Nodes = nodeMetaFilter(args.NodeMetaFilters, thisReply.Nodes)
-			}
-
-			raw, err := filter.Execute(thisReply.Nodes)
-			if err != nil {
-				return err
-			}
-			thisReply.Nodes = raw.(structs.CheckServiceNodes)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := h.srv.filterACL(args.Token, &thisReply); err != nil {
-				return err
-			}
-
-			if err := h.srv.sortNodesByDistanceFrom(args.Source, thisReply.Nodes); err != nil {
-				return err
+			// If sameness group was used, evaluate the index of the sameness group
+			// and update the index of the response if it is greater.  If sameness group is not
+			// used, the sgIdx will be 0 in this evaluation.
+			if sgIdx > thisReply.Index {
+				thisReply.Index = sgIdx
 			}
 
 			*reply = thisReply

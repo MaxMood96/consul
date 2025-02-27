@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package dataplane
 
@@ -13,6 +13,8 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/hashicorp/go-hclog"
+
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/consul/state"
@@ -23,7 +25,11 @@ import (
 )
 
 func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.GetEnvoyBootstrapParamsRequest) (*pbdataplane.GetEnvoyBootstrapParamsResponse, error) {
-	logger := s.Logger.Named("get-envoy-bootstrap-params").With("service_id", req.GetServiceId(), "request_id", external.TraceID())
+	proxyID := req.ProxyId
+	if req.GetServiceId() != "" {
+		proxyID = req.GetServiceId()
+	}
+	logger := s.Logger.Named("get-envoy-bootstrap-params").With("proxy_id", proxyID, "request_id", external.TraceID())
 
 	logger.Trace("Started processing request")
 	defer logger.Trace("Finished processing request")
@@ -42,7 +48,7 @@ func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.G
 
 	store := s.GetStore()
 
-	_, svc, err := store.ServiceNode(req.GetNodeId(), req.GetNodeName(), req.GetServiceId(), &entMeta, structs.DefaultPeerKeyword)
+	_, svc, err := store.ServiceNode(req.GetNodeId(), req.GetNodeName(), proxyID, &entMeta, structs.DefaultPeerKeyword)
 	if err != nil {
 		logger.Error("Error looking up service", "error", err)
 		if errors.Is(err, state.ErrNodeNotFound) {
@@ -81,8 +87,34 @@ func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.G
 	// Inspect access logging
 	// This is non-essential, and don't want to return an error unless there is a more serious issue
 	var accessLogs []string
-	if ns != nil && ns.Proxy.AccessLogs.Enabled {
-		envoyLoggers, err := accesslogs.MakeAccessLogs(&ns.Proxy.AccessLogs, false)
+	if ns != nil {
+		accessLogs = makeAccessLogs(&ns.Proxy.AccessLogs, logger)
+	}
+
+	// Build out the response
+	var serviceName string
+	if svc.ServiceKind == structs.ServiceKindConnectProxy {
+		serviceName = svc.ServiceProxy.DestinationServiceName
+	} else {
+		serviceName = svc.ServiceName
+	}
+
+	return &pbdataplane.GetEnvoyBootstrapParamsResponse{
+		Identity:   serviceName,
+		Service:    serviceName,
+		Partition:  svc.EnterpriseMeta.PartitionOrDefault(),
+		Namespace:  svc.EnterpriseMeta.NamespaceOrDefault(),
+		Config:     bootstrapConfig,
+		Datacenter: s.Datacenter,
+		NodeName:   svc.Node,
+		AccessLogs: accessLogs,
+	}, nil
+}
+
+func makeAccessLogs(logs *structs.AccessLogsConfig, logger hclog.Logger) []string {
+	var accessLogs []string
+	if logs.Enabled {
+		envoyLoggers, err := accesslogs.MakeAccessLogs(logs, false)
 		if err != nil {
 			logger.Warn("Error creating the envoy access log config", "error", err)
 		}
@@ -98,41 +130,5 @@ func (s *Server) GetEnvoyBootstrapParams(ctx context.Context, req *pbdataplane.G
 		}
 	}
 
-	// Build out the response
-	var serviceName string
-	if svc.ServiceKind == structs.ServiceKindConnectProxy {
-		serviceName = svc.ServiceProxy.DestinationServiceName
-	} else {
-		serviceName = svc.ServiceName
-	}
-
-	return &pbdataplane.GetEnvoyBootstrapParamsResponse{
-		Service:     serviceName,
-		Partition:   svc.EnterpriseMeta.PartitionOrDefault(),
-		Namespace:   svc.EnterpriseMeta.NamespaceOrDefault(),
-		Config:      bootstrapConfig,
-		Datacenter:  s.Datacenter,
-		ServiceKind: convertToResponseServiceKind(svc.ServiceKind),
-		NodeName:    svc.Node,
-		NodeId:      string(svc.ID),
-		AccessLogs:  accessLogs,
-	}, nil
-}
-
-func convertToResponseServiceKind(serviceKind structs.ServiceKind) (respKind pbdataplane.ServiceKind) {
-	switch serviceKind {
-	case structs.ServiceKindConnectProxy:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_CONNECT_PROXY
-	case structs.ServiceKindMeshGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_MESH_GATEWAY
-	case structs.ServiceKindTerminatingGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_TERMINATING_GATEWAY
-	case structs.ServiceKindIngressGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_INGRESS_GATEWAY
-	case structs.ServiceKindAPIGateway:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_API_GATEWAY
-	case structs.ServiceKindTypical:
-		respKind = pbdataplane.ServiceKind_SERVICE_KIND_TYPICAL
-	}
-	return
+	return accessLogs
 }

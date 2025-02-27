@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfg
 
@@ -12,10 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/go-hclog"
 
+	"github.com/hashicorp/consul/acl"
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
+	"github.com/hashicorp/consul/agent/leafcert"
 	"github.com/hashicorp/consul/agent/proxycfg/internal/watch"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib/maps"
@@ -123,6 +124,17 @@ func (s *handlerMeshGateway) initialize(ctx context.Context) (ConfigSnapshot, er
 		Source:         *s.source,
 		EnterpriseMeta: s.proxyID.EnterpriseMeta,
 	}, exportedServiceListWatchID, s.ch)
+	if err != nil {
+		return snap, err
+	}
+	// Watch for service default object that matches this mesh gateway's name
+	err = s.dataSources.ConfigEntry.Notify(ctx, &structs.ConfigEntryQuery{
+		Kind:           structs.ServiceDefaults,
+		Name:           s.service,
+		Datacenter:     s.source.Datacenter,
+		QueryOptions:   structs.QueryOptions{Token: s.token},
+		EnterpriseMeta: s.proxyID.EnterpriseMeta,
+	}, serviceDefaultsWatchID, s.ch)
 	if err != nil {
 		return snap, err
 	}
@@ -294,6 +306,7 @@ func (s *handlerMeshGateway) handleUpdate(ctx context.Context, u UpdateEvent, sn
 					QueryOptions:   structs.QueryOptions{Token: s.token},
 					ServiceKind:    structs.ServiceKindMeshGateway,
 					UseServiceKind: true,
+					NodesOnly:      true,
 					Source:         *s.source,
 					EnterpriseMeta: *entMeta,
 				}, fmt.Sprintf("mesh-gateway:%s", gk.String()), s.ch)
@@ -392,7 +405,7 @@ func (s *handlerMeshGateway) handleUpdate(ctx context.Context, u UpdateEvent, sn
 		if hasExports && snap.MeshGateway.LeafCertWatchCancel == nil {
 			// no watch and we need one
 			ctx, cancel := context.WithCancel(ctx)
-			err := s.dataSources.LeafCertificate.Notify(ctx, &cachetype.ConnectCALeafRequest{
+			err := s.dataSources.LeafCertificate.Notify(ctx, &leafcert.ConnectCALeafRequest{
 				Datacenter:     s.source.Datacenter,
 				Token:          s.token,
 				Kind:           structs.ServiceKindMeshGateway,
@@ -615,9 +628,11 @@ func (s *handlerMeshGateway) handleUpdate(ctx context.Context, u UpdateEvent, sn
 
 		peerServers := make(map[string]PeerServersValue)
 		for _, peering := range resp.Peerings {
-			// We only need to keep track of outbound establish connections
-			// for mesh gateway.
-			if !peering.ShouldDial() || !peering.IsActive() {
+			// We only need to keep track of outbound establish connections for mesh gateway.
+			// We could also check for the peering status, but this requires a response from the leader
+			// which holds the peerstream information. We want to allow stale reads so there could be peerings in
+			// a deleting or terminating state.
+			if !peering.ShouldDial() {
 				continue
 			}
 
@@ -644,6 +659,25 @@ func (s *handlerMeshGateway) handleUpdate(ctx context.Context, u UpdateEvent, sn
 		}
 
 		snap.MeshGateway.PeerServers = peerServers
+	case serviceDefaultsWatchID:
+		resp, ok := u.Result.(*structs.ConfigEntryResponse)
+		if !ok {
+			return fmt.Errorf("invalid type for config entry: %T", resp.Entry)
+		}
+
+		if resp.Entry == nil {
+			return nil
+		}
+		serviceDefaults, ok := resp.Entry.(*structs.ServiceConfigEntry)
+		if !ok {
+			return fmt.Errorf("invalid type for config entry: %T", resp.Entry)
+		}
+
+		if serviceDefaults.UpstreamConfig != nil && serviceDefaults.UpstreamConfig.Defaults != nil {
+			if serviceDefaults.UpstreamConfig.Defaults.Limits != nil {
+				snap.MeshGateway.Limits = serviceDefaults.UpstreamConfig.Defaults.Limits
+			}
+		}
 
 	default:
 		switch {

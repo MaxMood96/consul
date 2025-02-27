@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package upgrade
 
 import (
@@ -19,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const sdsServerPort = 1234
@@ -38,8 +42,9 @@ func TestIngressGateway_SDS_UpgradeToTarget_fromLatest(t *testing.T) {
 		NumServers: 1,
 		NumClients: 2,
 		BuildOpts: &libcluster.BuildOptions{
-			Datacenter:    "dc1",
-			ConsulVersion: utils.LatestVersion,
+			Datacenter:      "dc1",
+			ConsulImageName: utils.GetLatestImageName(),
+			ConsulVersion:   utils.LatestVersion,
 		},
 		ApplyDefaultProxySettings: true,
 	})
@@ -146,7 +151,14 @@ func TestIngressGateway_SDS_UpgradeToTarget_fromLatest(t *testing.T) {
 {
   "name": "%s",
   "connect_timeout": "5s",
-  "http2_protocol_options": {},
+  "typed_extension_protocol_options": {
+    "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+	  "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+	  "explicit_http_config": {
+	    "http2_protocol_options": {}
+	  }
+    }
+  },
   "type": "LOGICAL_DNS",
   "load_assignment": {
     "cluster_name": "%s",
@@ -271,7 +283,7 @@ func TestIngressGateway_SDS_UpgradeToTarget_fromLatest(t *testing.T) {
 
 	// Upgrade the cluster to utils.TargetVersion
 	t.Logf("Upgrade to version %s", utils.TargetVersion)
-	err = cluster.StandardUpgrade(t, context.Background(), utils.TargetVersion)
+	err = cluster.StandardUpgrade(t, context.Background(), utils.GetTargetImageName(), utils.TargetVersion)
 	require.NoError(t, err)
 	require.NoError(t, igw.Restart())
 
@@ -309,10 +321,8 @@ func createSDSServer(t *testing.T, cluster *libcluster.Cluster) (containerName s
 	_, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		Started: true,
 		ContainerRequest: testcontainers.ContainerRequest{
-			FromDockerfile: testcontainers.FromDockerfile{
-				Context: sdsServerFilesPath,
-			},
-			Name: containerName,
+			Image: "consul-sds-server",
+			Name:  containerName,
 			Networks: []string{
 				cluster.NetworkName,
 			},
@@ -328,6 +338,7 @@ func createSDSServer(t *testing.T, cluster *libcluster.Cluster) (containerName s
 					ReadOnly: true,
 				},
 			},
+			WaitingFor: wait.ForLog("").WithStartupTimeout(60 * time.Second),
 		},
 	})
 	require.NoError(t, err, "create SDS server container")

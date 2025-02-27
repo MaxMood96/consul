@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package structs
 
@@ -12,12 +12,11 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-
-	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/hashstructure"
 	"github.com/mitchellh/mapstructure"
 
 	"github.com/hashicorp/consul-net-rpc/go-msgpack/codec"
+	"github.com/hashicorp/go-multierror"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
@@ -27,24 +26,26 @@ import (
 )
 
 const (
-	ServiceDefaults    string = "service-defaults"
-	ProxyDefaults      string = "proxy-defaults"
-	ServiceRouter      string = "service-router"
-	ServiceSplitter    string = "service-splitter"
-	ServiceResolver    string = "service-resolver"
-	IngressGateway     string = "ingress-gateway"
-	TerminatingGateway string = "terminating-gateway"
-	ServiceIntentions  string = "service-intentions"
-	MeshConfig         string = "mesh"
-	ExportedServices   string = "exported-services"
-	SamenessGroup      string = "sameness-group"
-	APIGateway         string = "api-gateway"
-	BoundAPIGateway    string = "bound-api-gateway"
-	InlineCertificate  string = "inline-certificate"
-	HTTPRoute          string = "http-route"
-	TCPRoute           string = "tcp-route"
+	ServiceDefaults       string = "service-defaults"
+	ProxyDefaults         string = "proxy-defaults"
+	ServiceRouter         string = "service-router"
+	ServiceSplitter       string = "service-splitter"
+	ServiceResolver       string = "service-resolver"
+	IngressGateway        string = "ingress-gateway"
+	TerminatingGateway    string = "terminating-gateway"
+	ServiceIntentions     string = "service-intentions"
+	MeshConfig            string = "mesh"
+	ExportedServices      string = "exported-services"
+	SamenessGroup         string = "sameness-group"
+	APIGateway            string = "api-gateway"
+	BoundAPIGateway       string = "bound-api-gateway"
+	FileSystemCertificate string = "file-system-certificate"
+	InlineCertificate     string = "inline-certificate"
+	HTTPRoute             string = "http-route"
+	TCPRoute              string = "tcp-route"
 	// TODO: decide if we want to highlight 'ip' keyword in the name of RateLimitIPConfig
 	RateLimitIPConfig string = "control-plane-request-limit"
+	JWTProvider       string = "jwt-provider"
 
 	ProxyConfigGlobal string = "global"
 	MeshConfigMesh    string = "mesh"
@@ -70,8 +71,10 @@ var AllConfigEntryKinds = []string{
 	BoundAPIGateway,
 	HTTPRoute,
 	TCPRoute,
+	FileSystemCertificate,
 	InlineCertificate,
 	RateLimitIPConfig,
+	JWTProvider,
 }
 
 // ConfigEntry is the interface for centralized configuration stored in Raft.
@@ -93,6 +96,16 @@ type ConfigEntry interface {
 	GetMeta() map[string]string
 	GetEnterpriseMeta() *acl.EnterpriseMeta
 	GetRaftIndex() *RaftIndex
+	GetHash() uint64
+	SetHash(h uint64)
+}
+
+func HashConfigEntry(conf ConfigEntry) (uint64, error) {
+	hash, err := hashstructure.Hash(conf, nil)
+	if err != nil {
+		return hash, err
+	}
+	return hash, nil
 }
 
 // ControlledConfigEntry is an optional interface implemented by a ConfigEntry
@@ -125,6 +138,26 @@ type WarningConfigEntry interface {
 	ConfigEntry
 }
 
+type MutualTLSMode string
+
+const (
+	MutualTLSModeDefault    MutualTLSMode = ""
+	MutualTLSModeStrict     MutualTLSMode = "strict"
+	MutualTLSModePermissive MutualTLSMode = "permissive"
+)
+
+func (m MutualTLSMode) validate() error {
+	switch m {
+	case MutualTLSModeDefault, MutualTLSModeStrict, MutualTLSModePermissive:
+		return nil
+	}
+	return fmt.Errorf("Invalid MutualTLSMode %q. Must be one of %q, %q, or %q.", m,
+		MutualTLSModeDefault,
+		MutualTLSModeStrict,
+		MutualTLSModePermissive,
+	)
+}
+
 // ServiceConfiguration is the top-level struct for the configuration of a service
 // across the entire cluster.
 type ServiceConfigEntry struct {
@@ -133,6 +166,7 @@ type ServiceConfigEntry struct {
 	Protocol                  string
 	Mode                      ProxyMode              `json:",omitempty"`
 	TransparentProxy          TransparentProxyConfig `json:",omitempty" alias:"transparent_proxy"`
+	MutualTLSMode             MutualTLSMode          `json:",omitempty" alias:"mutual_tls_mode"`
 	MeshGateway               MeshGatewayConfig      `json:",omitempty" alias:"mesh_gateway"`
 	Expose                    ExposeConfig           `json:",omitempty"`
 	ExternalSNI               string                 `json:",omitempty" alias:"external_sni"`
@@ -142,11 +176,21 @@ type ServiceConfigEntry struct {
 	LocalConnectTimeoutMs     int                    `json:",omitempty" alias:"local_connect_timeout_ms"`
 	LocalRequestTimeoutMs     int                    `json:",omitempty" alias:"local_request_timeout_ms"`
 	BalanceInboundConnections string                 `json:",omitempty" alias:"balance_inbound_connections"`
+	RateLimits                *RateLimits            `json:",omitempty" alias:"rate_limits"`
 	EnvoyExtensions           EnvoyExtensions        `json:",omitempty" alias:"envoy_extensions"`
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ServiceConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ServiceConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ServiceConfigEntry) Clone() *ServiceConfigEntry {
@@ -201,6 +245,11 @@ func (e *ServiceConfigEntry) Normalize() error {
 			}
 		}
 	}
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 
 	return validationErr
 }
@@ -217,6 +266,12 @@ func (e *ServiceConfigEntry) Validate() error {
 
 	if !isValidConnectionBalance(e.BalanceInboundConnections) {
 		validationErr = multierror.Append(validationErr, fmt.Errorf("invalid value for balance_inbound_connections: %v", e.BalanceInboundConnections))
+	}
+
+	switch e.Protocol {
+	case "", "http", "http2", "grpc", "tcp":
+	default:
+		validationErr = multierror.Append(validationErr, fmt.Errorf("invalid value for protocol: %v", e.Protocol))
 	}
 
 	// External endpoints are invalid with an existing service's upstream configuration
@@ -263,8 +318,16 @@ func (e *ServiceConfigEntry) Validate() error {
 		}
 	}
 
+	if err := validateRatelimit(e.RateLimits); err != nil {
+		validationErr = multierror.Append(validationErr, err)
+	}
+
 	if err := envoyextensions.ValidateExtensions(e.EnvoyExtensions.ToAPI()); err != nil {
 		validationErr = multierror.Append(validationErr, err)
+	}
+
+	if err := e.MutualTLSMode.validate(); err != nil {
+		return err
 	}
 
 	return validationErr
@@ -355,32 +418,81 @@ type DestinationConfig struct {
 	Port int `json:",omitempty"`
 }
 
-func IsHostname(address string) bool {
-	ip := net.ParseIP(address)
-	return ip == nil
-}
-
 func IsIP(address string) bool {
 	ip := net.ParseIP(address)
 	return ip != nil
 }
 
+// RateLimits is rate limiting configuration that is applied to
+// inbound traffic for a service.
+// Rate limiting is a Consul enterprise feature.
+type RateLimits struct {
+	InstanceLevel InstanceLevelRateLimits `alias:"instance_level"`
+}
+
+// InstanceLevelRateLimits represents rate limit configuration
+// that are applied per service instance.
+type InstanceLevelRateLimits struct {
+	// RequestsPerSecond is the average number of requests per second that can be
+	// made without being throttled. This field is required if RequestsMaxBurst
+	// is set. The allowed number of requests may exceed RequestsPerSecond up to
+	// the value specified in RequestsMaxBurst.
+	//
+	// Internally, this is the refill rate of the token bucket used for rate limiting.
+	RequestsPerSecond int `alias:"requests_per_second"`
+
+	// RequestsMaxBurst is the maximum number of requests that can be sent
+	// in a burst. Should be equal to or greater than RequestsPerSecond.
+	// If unset, defaults to RequestsPerSecond.
+	//
+	// Internally, this is the maximum size of the token bucket used for rate limiting.
+	RequestsMaxBurst int `alias:"requests_max_burst"`
+
+	// Routes is a list of rate limits applied to specific routes.
+	// For a given request, the first matching route will be applied, if any.
+	// Overrides any top-level configuration.
+	Routes []InstanceLevelRouteRateLimits
+}
+
+// InstanceLevelRouteRateLimits represents rate limit configuration
+// applied to a route matching one of PathExact/PathPrefix/PathRegex.
+type InstanceLevelRouteRateLimits struct {
+	PathExact  string `alias:"path_exact"`
+	PathPrefix string `alias:"path_prefix"`
+	PathRegex  string `alias:"path_regex"`
+
+	RequestsPerSecond int `alias:"requests_per_second"`
+	RequestsMaxBurst  int `alias:"requests_max_burst"`
+}
+
 // ProxyConfigEntry is the top-level struct for global proxy configuration defaults.
 type ProxyConfigEntry struct {
-	Kind             string
-	Name             string
-	Config           map[string]interface{}
-	Mode             ProxyMode                      `json:",omitempty"`
-	TransparentProxy TransparentProxyConfig         `json:",omitempty" alias:"transparent_proxy"`
-	MeshGateway      MeshGatewayConfig              `json:",omitempty" alias:"mesh_gateway"`
-	Expose           ExposeConfig                   `json:",omitempty"`
-	AccessLogs       AccessLogsConfig               `json:",omitempty" alias:"access_logs"`
-	EnvoyExtensions  EnvoyExtensions                `json:",omitempty" alias:"envoy_extensions"`
-	FailoverPolicy   *ServiceResolverFailoverPolicy `json:",omitempty" alias:"failover_policy"`
+	Kind                 string
+	Name                 string
+	Config               map[string]interface{}
+	Protocol             string                               `json:"-"`
+	Mode                 ProxyMode                            `json:",omitempty"`
+	TransparentProxy     TransparentProxyConfig               `json:",omitempty" alias:"transparent_proxy"`
+	MutualTLSMode        MutualTLSMode                        `json:",omitempty" alias:"mutual_tls_mode"`
+	MeshGateway          MeshGatewayConfig                    `json:",omitempty" alias:"mesh_gateway"`
+	Expose               ExposeConfig                         `json:",omitempty"`
+	AccessLogs           AccessLogsConfig                     `json:",omitempty" alias:"access_logs"`
+	EnvoyExtensions      EnvoyExtensions                      `json:",omitempty" alias:"envoy_extensions"`
+	FailoverPolicy       *ServiceResolverFailoverPolicy       `json:",omitempty" alias:"failover_policy"`
+	PrioritizeByLocality *ServiceResolverPrioritizeByLocality `json:",omitempty" alias:"prioritize_by_locality"`
 
 	Meta               map[string]string `json:",omitempty"`
+	Hash               uint64            `json:",omitempty" hash:"ignore"`
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
-	RaftIndex
+	RaftIndex          `hash:"ignore"`
+}
+
+func (e *ProxyConfigEntry) SetHash(h uint64) {
+	e.Hash = h
+}
+
+func (e *ProxyConfigEntry) GetHash() uint64 {
+	return e.Hash
 }
 
 func (e *ProxyConfigEntry) GetKind() string {
@@ -402,6 +514,22 @@ func (e *ProxyConfigEntry) GetMeta() map[string]string {
 	return e.Meta
 }
 
+func (e *ProxyConfigEntry) ComputeProtocol() error {
+	// proxyConfig is a snippet from agent/xds/config.go:ProxyConfig
+	// We calculate this up-front so that the expensive mapstructure decode
+	// is not needed during discovery chain compile time.
+	type proxyConfig struct {
+		Protocol string `mapstructure:"protocol"`
+	}
+	var cfg proxyConfig
+	err := mapstructure.WeakDecode(e.Config, &cfg)
+	if err != nil {
+		return err
+	}
+	e.Protocol = cfg.Protocol
+	return nil
+}
+
 func (e *ProxyConfigEntry) Normalize() error {
 	if e == nil {
 		return fmt.Errorf("config entry is nil")
@@ -419,7 +547,17 @@ func (e *ProxyConfigEntry) Normalize() error {
 
 	e.EnterpriseMeta.Normalize()
 
+	if err := e.ComputeProtocol(); err != nil {
+		return err
+	}
+
+	h, err := HashConfigEntry(e)
+	if err != nil {
+		return err
+	}
+	e.Hash = h
 	return nil
+
 }
 
 func (e *ProxyConfigEntry) Validate() error {
@@ -439,12 +577,24 @@ func (e *ProxyConfigEntry) Validate() error {
 		return err
 	}
 
+	if err := validateOpaqueProxyConfig(e.Config); err != nil {
+		return fmt.Errorf("Config: %w", err)
+	}
+
 	if err := envoyextensions.ValidateExtensions(e.EnvoyExtensions.ToAPI()); err != nil {
 		return err
 	}
 
-	if !e.FailoverPolicy.isValid() {
-		return fmt.Errorf("Failover policy must be one of '', 'default', or 'order-by-locality'")
+	if err := e.FailoverPolicy.validate(); err != nil {
+		return err
+	}
+
+	if err := e.PrioritizeByLocality.validate(); err != nil {
+		return err
+	}
+
+	if err := e.MutualTLSMode.validate(); err != nil {
+		return err
 	}
 
 	return e.validateEnterpriseMeta()
@@ -533,7 +683,7 @@ func (e *ProxyConfigEntry) UnmarshalBinary(data []byte) error {
 // into a concrete type.
 //
 // There is an 'api' variation of this in
-// command/config/write/config_write.go:newDecodeConfigEntry
+// command/helpers/helpers.go:newDecodeConfigEntry
 func DecodeConfigEntry(raw map[string]interface{}) (ConfigEntry, error) {
 	var entry ConfigEntry
 
@@ -689,12 +839,16 @@ func MakeConfigEntry(kind, name string) (ConfigEntry, error) {
 		return &APIGatewayConfigEntry{Name: name}, nil
 	case BoundAPIGateway:
 		return &BoundAPIGatewayConfigEntry{Name: name}, nil
+	case FileSystemCertificate:
+		return &FileSystemCertificateConfigEntry{Name: name}, nil
 	case InlineCertificate:
 		return &InlineCertificateConfigEntry{Name: name}, nil
 	case HTTPRoute:
 		return &HTTPRouteConfigEntry{Name: name}, nil
 	case TCPRoute:
 		return &TCPRouteConfigEntry{Name: name}, nil
+	case JWTProvider:
+		return &JWTProviderConfigEntry{Name: name}, nil
 	default:
 		return nil, fmt.Errorf("invalid config entry kind: %s", kind)
 	}
@@ -781,19 +935,6 @@ type ServiceConfigRequest struct {
 
 func (s *ServiceConfigRequest) RequestDatacenter() string {
 	return s.Datacenter
-}
-
-// GetLocalUpstreamIDs returns the list of non-peer service ids for upstreams defined on this request.
-// This is often used for fetching service-defaults config entries.
-func (s *ServiceConfigRequest) GetLocalUpstreamIDs() []ServiceID {
-	var upstreams []ServiceID
-	for i := range s.UpstreamServiceNames {
-		u := &s.UpstreamServiceNames[i]
-		if u.Peer == "" {
-			upstreams = append(upstreams, u.ServiceName.ToServiceID())
-		}
-	}
-	return upstreams
 }
 
 func (r *ServiceConfigRequest) CacheInfo() cache.RequestInfo {
@@ -1062,6 +1203,16 @@ type PassiveHealthCheck struct {
 	// when an outlier status is detected through consecutive 5xx.
 	// This setting can be used to disable ejection or to ramp it up slowly. Defaults to 100.
 	EnforcingConsecutive5xx *uint32 `json:",omitempty" alias:"enforcing_consecutive_5xx"`
+
+	// The maximum % of an upstream cluster that can be ejected due to outlier detection.
+	// Defaults to 10% but will eject at least one host regardless of the value.
+	// TODO: remove me
+	MaxEjectionPercent *uint32 `json:",omitempty" alias:"max_ejection_percent"`
+
+	// The base time that a host is ejected for. The real time is equal to the base time
+	// multiplied by the number of times the host has been ejected and is capped by
+	// max_ejection_time (Default 300s). Defaults to 30000ms or 30s.
+	BaseEjectionTime *time.Duration `json:",omitempty" alias:"base_ejection_time"`
 }
 
 func (chk *PassiveHealthCheck) Clone() *PassiveHealthCheck {
@@ -1080,6 +1231,15 @@ func (chk *PassiveHealthCheck) IsZero() bool {
 func (chk PassiveHealthCheck) Validate() error {
 	if chk.Interval < 0*time.Second {
 		return fmt.Errorf("passive health check interval cannot be negative")
+	}
+	if chk.EnforcingConsecutive5xx != nil && *chk.EnforcingConsecutive5xx > 100 {
+		return fmt.Errorf("passive health check enforcing_consecutive_5xx must be a percentage between 0 and 100")
+	}
+	if chk.MaxEjectionPercent != nil && *chk.MaxEjectionPercent > 100 {
+		return fmt.Errorf("passive health check max_ejection_percent must be a percentage between 0 and 100")
+	}
+	if chk.BaseEjectionTime != nil && *chk.BaseEjectionTime < 0*time.Second {
+		return fmt.Errorf("passive health check base_ejection_time cannot be negative")
 	}
 	return nil
 }
@@ -1152,9 +1312,11 @@ type ServiceConfigResponse struct {
 	MeshGateway      MeshGatewayConfig      `json:",omitempty"`
 	Expose           ExposeConfig           `json:",omitempty"`
 	TransparentProxy TransparentProxyConfig `json:",omitempty"`
+	MutualTLSMode    MutualTLSMode          `json:",omitempty"`
 	Mode             ProxyMode              `json:",omitempty"`
 	Destination      DestinationConfig      `json:",omitempty"`
 	AccessLogs       AccessLogsConfig       `json:",omitempty"`
+	RateLimits       RateLimits             `json:",omitempty"`
 	Meta             map[string]string      `json:",omitempty"`
 	EnvoyExtensions  []EnvoyExtension       `json:",omitempty"`
 	QueryMeta
@@ -1267,6 +1429,17 @@ func (c *ConfigEntryResponse) UnmarshalBinary(data []byte) error {
 		return err
 	}
 
+	return nil
+}
+
+func validateOpaqueProxyConfig(config map[string]interface{}) error {
+	// This max is chosen to stay under the 104 character limit on OpenBSD, FreeBSD, MacOS.
+	// It assumes the socket's filename is fixed at 32 characters.
+	const maxSocketDirLen = 70
+
+	if path, _ := config["envoy_hcp_metrics_bind_socket_dir"].(string); len(path) > maxSocketDirLen {
+		return fmt.Errorf("envoy_hcp_metrics_bind_socket_dir length %d exceeds max %d", len(path), maxSocketDirLen)
+	}
 	return nil
 }
 

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package logging
 
@@ -17,9 +17,11 @@ const (
 	CentralConfig         string = "central_config"
 	ConfigEntry           string = "config_entry"
 	Connect               string = "connect"
+	ConnectCA             string = "connect-ca"
 	Consul                string = "consul"
 	ConsulClient          string = "client"
 	ConsulServer          string = "server"
+	ControllerRuntime     string = "controller-runtime"
 	Coordinate            string = "coordinate"
 	DNS                   string = "dns"
 	Envoy                 string = "envoy"
@@ -56,6 +58,7 @@ const (
 	Snapshot              string = "snapshot"
 	Partition             string = "partition"
 	Peering               string = "peering"
+	PeerStream            string = "peerstream"
 	PeeringMetrics        string = "peering_metrics"
 	TCPRouteController    string = "tcp_route_controller"
 	TerminatingGateway    string = "terminating_gateway"
@@ -69,5 +72,10 @@ const (
 	XDS                   string = "xds"
 	XDSCapacityController string = "xds_capacity_controller"
 	Vault                 string = "vault"
+	V2ExportsShim         string = "v2_exports_shim"
 	Health                string = "health"
+	GRPCAPI               string = "grpc-api"
+	Resource              string = "resource"
+	Dataplane             string = "dataplane"
+	ServerDiscovery       string = "server-discovery"
 )

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package leakcheck
 
@@ -64,9 +64,7 @@ func setupPrimaryServer(t *testing.T) *agent.TestAgent {
 
 	config := `
 	   server = true
-		datacenter = "primary"
-		primary_datacenter = "primary"
-		
+		datacenter = "primary"	
 		connect {
 			enabled = true
 		}

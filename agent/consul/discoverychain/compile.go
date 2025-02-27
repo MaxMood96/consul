@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package discoverychain
 
@@ -8,14 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mitchellh/hashstructure"
-	"github.com/mitchellh/mapstructure"
-
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/proto/private/pbpeering"
+	"github.com/mitchellh/hashstructure"
 )
 
 type CompileRequest struct {
@@ -44,6 +42,11 @@ type CompileRequest struct {
 	OverrideConnectTimeout time.Duration
 
 	Entries *configentry.DiscoveryChainSet
+
+	// AutoVirtualIPs and ManualVirtualIPs are lists of IPs associated with
+	// the service.
+	AutoVirtualIPs   []string
+	ManualVirtualIPs []string
 }
 
 // Compile assembles a discovery chain in the form of a graph of nodes using
@@ -98,6 +101,8 @@ func Compile(req CompileRequest) (*structs.CompiledDiscoveryChain, error) {
 		overrideProtocol:       req.OverrideProtocol,
 		overrideConnectTimeout: req.OverrideConnectTimeout,
 		entries:                entries,
+		autoVirtualIPs:         req.AutoVirtualIPs,
+		manualVirtualIPs:       req.ManualVirtualIPs,
 
 		resolvers:     make(map[structs.ServiceID]*structs.ServiceResolverConfigEntry),
 		splitterNodes: make(map[string]*structs.DiscoveryGraphNode),
@@ -138,6 +143,11 @@ type compiler struct {
 	//
 	// This is an INPUT field.
 	entries *configentry.DiscoveryChainSet
+
+	// autoVirtualIPs and manualVirtualIPs are lists of IPs associated with
+	// the service.
+	autoVirtualIPs   []string
+	manualVirtualIPs []string
 
 	// resolvers is initially seeded by copying the provided entries.Resolvers
 	// map and default resolvers are added as they are needed.
@@ -232,19 +242,11 @@ func (c *compiler) recordServiceProtocol(sid structs.ServiceID) error {
 		return c.recordProtocol(sid, serviceDefault.Protocol)
 	}
 	if proxyDefault := c.entries.GetProxyDefaults(sid.PartitionOrDefault()); proxyDefault != nil {
-		var cfg proxyConfig
-		// Ignore errors and fallback on defaults if it does happen.
-		_ = mapstructure.WeakDecode(proxyDefault.Config, &cfg)
-		if cfg.Protocol != "" {
-			return c.recordProtocol(sid, cfg.Protocol)
+		if proxyDefault.Protocol != "" {
+			return c.recordProtocol(sid, proxyDefault.Protocol)
 		}
 	}
 	return c.recordProtocol(sid, "")
-}
-
-// proxyConfig is a snippet from agent/xds/config.go:ProxyConfig
-type proxyConfig struct {
-	Protocol string `mapstructure:"protocol"`
 }
 
 func (c *compiler) recordProtocol(fromService structs.ServiceID, protocol string) error {
@@ -352,6 +354,8 @@ func (c *compiler) compile() (*structs.CompiledDiscoveryChain, error) {
 		StartNode:         c.startNode,
 		Nodes:             c.nodes,
 		Targets:           c.loadedTargets,
+		AutoVirtualIPs:    c.autoVirtualIPs,
+		ManualVirtualIPs:  c.manualVirtualIPs,
 	}, nil
 }
 
@@ -382,7 +386,6 @@ func (c *compiler) determineIfDefaultChain() bool {
 	}
 
 	target := c.loadedTargets[node.Resolver.Target]
-
 	return target.Service == c.serviceName && target.Namespace == c.evaluateInNamespace && target.Partition == c.evaluateInPartition
 }
 
@@ -1004,6 +1007,19 @@ RESOLVE_AGAIN:
 		LoadBalancer: resolver.LoadBalancer,
 	}
 
+	proxyDefault := c.entries.GetProxyDefaults(targetID.PartitionOrDefault())
+
+	// Only set PrioritizeByLocality for targets in the same partition.
+	if target.Partition == c.evaluateInPartition && target.Peer == "" {
+		if resolver.PrioritizeByLocality != nil {
+			target.PrioritizeByLocality = resolver.PrioritizeByLocality.ToDiscovery()
+		}
+
+		if target.PrioritizeByLocality == nil && proxyDefault != nil {
+			target.PrioritizeByLocality = proxyDefault.PrioritizeByLocality.ToDiscovery()
+		}
+	}
+
 	target.Subset = resolver.Subsets[target.ServiceSubset]
 
 	if serviceDefault := c.entries.GetService(targetID); serviceDefault != nil && serviceDefault.ExternalSNI != "" {
@@ -1089,7 +1105,7 @@ RESOLVE_AGAIN:
 	// Determine which failover definitions apply.
 	var failoverTargets []*structs.DiscoveryTarget
 	var failoverPolicy *structs.ServiceResolverFailoverPolicy
-	proxyDefault := c.entries.GetProxyDefaults(targetID.PartitionOrDefault())
+
 	if proxyDefault != nil {
 		failoverPolicy = proxyDefault.FailoverPolicy
 	}
@@ -1190,7 +1206,7 @@ func (c *compiler) makeSamenessGroupFailover(target *structs.DiscoveryTarget, op
 	}
 
 	var failoverTargets []*structs.DiscoveryTarget
-	for _, t := range samenessGroup.ToFailoverTargets() {
+	for _, t := range samenessGroup.ToServiceResolverFailoverTargets() {
 		// Rewrite the target as per the failover policy.
 		targetOpts := structs.MergeDiscoveryTargetOpts(opts, t.ToDiscoveryTargetOpts())
 		failoverTarget := c.rewriteTarget(target, targetOpts)

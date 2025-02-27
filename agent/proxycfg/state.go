@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfg
 
@@ -13,12 +13,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/go-hclog"
 	"golang.org/x/time/rate"
 
+	"github.com/hashicorp/go-hclog"
+
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
+	"github.com/hashicorp/consul/agent/proxycfg/internal/watch"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/logging"
+	"github.com/hashicorp/consul/proto/private/pbpeering"
 )
 
 const (
@@ -34,8 +37,12 @@ const (
 	consulServerListWatchID            = "consul-server-list"
 	datacentersWatchID                 = "datacenters"
 	serviceResolversWatchID            = "service-resolvers"
+	serviceDefaultsWatchID             = "service-defaults"
 	gatewayServicesWatchID             = "gateway-services"
 	gatewayConfigWatchID               = "gateway-config"
+	apiGatewayConfigWatchID            = "api-gateway-config"
+	boundGatewayConfigWatchID          = "bound-gateway-config"
+	fileSystemCertificateConfigWatchID = "file-system-certificate-config"
 	inlineCertificateConfigWatchID     = "inline-certificate-config"
 	routeConfigWatchID                 = "route-config"
 	externalServiceIDPrefix            = "external-service:"
@@ -44,6 +51,7 @@ const (
 	serviceResolverIDPrefix            = "service-resolver:"
 	serviceIntentionsIDPrefix          = "service-intentions:"
 	intentionUpstreamsID               = "intention-upstreams"
+	jwtProviderID                      = "jwt-provider"
 	peerServersWatchID                 = "peer-servers"
 	peeredUpstreamsID                  = "peered-upstreams"
 	intentionUpstreamsDestinationID    = "intention-upstreams-destination"
@@ -123,6 +131,7 @@ type serviceInstance struct {
 	taggedAddresses map[string]structs.ServiceAddress
 	proxyCfg        structs.ConnectProxyConfig
 	token           string
+	locality        *structs.Locality
 }
 
 func copyProxyConfig(ns *structs.NodeService) (structs.ConnectProxyConfig, error) {
@@ -243,6 +252,7 @@ func newServiceInstanceFromNodeService(id ProxyID, ns *structs.NodeService, toke
 	return serviceInstance{
 		kind:            ns.Kind,
 		service:         ns.Service,
+		locality:        ns.Locality,
 		proxyID:         id,
 		address:         ns.Address,
 		port:            ns.Port,
@@ -302,6 +312,7 @@ func newConfigSnapshotFromServiceInstance(s serviceInstance, config stateConfig)
 	return ConfigSnapshot{
 		Kind:                  s.kind,
 		Service:               s.service,
+		ServiceLocality:       s.locality,
 		ProxyID:               s.proxyID,
 		Address:               s.address,
 		Port:                  s.port,
@@ -538,7 +549,53 @@ func watchMeshGateway(ctx context.Context, opts gatewayWatchOpts) error {
 		QueryOptions:   structs.QueryOptions{Token: opts.token},
 		ServiceKind:    structs.ServiceKindMeshGateway,
 		UseServiceKind: true,
+		NodesOnly:      true,
 		Source:         opts.source,
 		EnterpriseMeta: *structs.DefaultEnterpriseMetaInPartition(opts.key.Partition),
 	}, correlationId, opts.notifyCh)
+}
+
+func reconcilePeeringWatches(compiledDiscoveryChains map[UpstreamID]*structs.CompiledDiscoveryChain, upstreams map[UpstreamID]*structs.Upstream, peeredUpstreams map[UpstreamID]struct{}, peerUpstreamEndpoints watch.Map[UpstreamID, structs.CheckServiceNodes], upstreamPeerTrustBundles watch.Map[PeerName, *pbpeering.PeeringTrustBundle]) {
+
+	peeredChainTargets := make(map[UpstreamID]struct{})
+	for _, discoChain := range compiledDiscoveryChains {
+		for _, target := range discoChain.Targets {
+			if target.Peer == "" {
+				continue
+			}
+			uid := NewUpstreamIDFromTargetID(target.ID)
+			peeredChainTargets[uid] = struct{}{}
+		}
+	}
+
+	validPeerNames := make(map[string]struct{})
+
+	// Iterate through all known endpoints and remove references to upstream IDs that weren't in the update
+	peerUpstreamEndpoints.ForEachKey(func(uid UpstreamID) bool {
+		// Peered upstream is explicitly defined in upstream config
+		if _, ok := upstreams[uid]; ok {
+			validPeerNames[uid.Peer] = struct{}{}
+			return true
+		}
+		// Peered upstream came from dynamic source of imported services
+		if _, ok := peeredUpstreams[uid]; ok {
+			validPeerNames[uid.Peer] = struct{}{}
+			return true
+		}
+		// Peered upstream came from a discovery chain target
+		if _, ok := peeredChainTargets[uid]; ok {
+			validPeerNames[uid.Peer] = struct{}{}
+			return true
+		}
+		peerUpstreamEndpoints.CancelWatch(uid)
+		return true
+	})
+
+	// Iterate through all known trust bundles and remove references to any unseen peer names
+	upstreamPeerTrustBundles.ForEachKey(func(peerName PeerName) bool {
+		if _, ok := validPeerNames[peerName]; !ok {
+			upstreamPeerTrustBundles.CancelWatch(peerName)
+		}
+		return true
+	})
 }
